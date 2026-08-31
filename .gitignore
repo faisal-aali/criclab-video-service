@@ -1,0 +1,13 @@
+.venv/
+.venv312/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+storage/
+*.mp4
+*.mov
+.Python
+.vercel
+.env*
+!.env.example
