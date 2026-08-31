@@ -18,8 +18,3 @@ boto3>=1.35.0
 pydantic-settings>=2.6.0
 python-dotenv>=1.0.0
 pillow>=11.0.0
-# --- Auth, email, validation (added for the accounts platform) ---
-pyjwt>=2.9.0
-bcrypt>=4.2.0
-aiosmtplib>=3.0.0
-email-validator>=2.2.0

@@ -6,13 +6,14 @@ MediaPipe so the web process stays free — closing a tab does not stop a job.
 
 ## Run locally
 
-Same Mongo and `STORAGE_DIR` as `criclab-web-backend`.
+Same Mongo, Cloudinary, and `STORAGE_DIR` as `criclab-web-backend`.
+Auth, SMTP, and CORS stay on the website API — they are not used here.
 
 ```bash
 python3.11 -m venv .venv312
 source .venv312/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # point MONGODB_URI at the same database
+cp .env.example .env   # already filled locally; keep it gitignored
 
 # terminal 1 — optional health API on :8001
 uvicorn app.main:app --port 8001
@@ -26,8 +27,8 @@ jobs stay at `queued` until one is.
 
 ## Production (Lightsail)
 
-Clone to `/var/www/criclab-video-service`, same `.env` Mongo/Cloudinary as the
-API, same `STORAGE_DIR`, then:
+Clone to `/var/www/criclab-video-service`, copy `.env` (Mongo / Cloudinary /
+`STORAGE_DIR` matching the API), then:
 
 ```bash
 pm2 start deploy/ecosystem.config.cjs
