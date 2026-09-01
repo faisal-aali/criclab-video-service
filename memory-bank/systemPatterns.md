@@ -34,6 +34,7 @@ Same relative filenames (`agent/ollama_agent.py`, `balltrack/stumps.py`) are all
 ## Worker loop
 
 - One process = one clip at a time (`python -m app.worker`).
+- Ingest always downloads `source_url` from Cloudinary into this process `STORAGE_DIR`. Never reuse Mongo `path` or a leftover local file (those paths are often from another machine).
 - Claims Action jobs first, then Ball-flight if the Action queue is empty.
 - Parallel clips = more processes (production PM2 `criclab-video-worker` is `instances: 1`).
 - Stale `claimed` jobs older than 45 minutes are re-queued.
