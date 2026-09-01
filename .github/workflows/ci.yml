@@ -1,0 +1,50 @@
+# Compile must pass. Deploy runs only after CI on main (merge or dispatch).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile
+        run: python -m compileall -q app
+
+  deploy:
+    name: Deploy
+    needs: ci
+    if: github.event_name != 'pull_request'
+    runs-on: self-hosted
+    env:
+      APP_DIR: /var/www/criclab-video-service
+      PYTHON: python3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: git pull
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash deploy/pull.sh "$APP_DIR" main
+
+      - name: Install and restart
+        run: bash "$APP_DIR/deploy/restart.sh"
