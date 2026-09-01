@@ -293,6 +293,7 @@ async def run_analysis_job(
             job_id, status="failed",
             message=str(e), error=traceback.format_exc(),
         )
+        raise
 
 
 def _strip_series(action: dict[str, Any]) -> dict[str, Any]:

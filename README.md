@@ -2,7 +2,11 @@
 
 Dedicated workers for Action analysis and Ball flight. The website API only
 creates `queued` jobs in Mongo. These processes claim them and run OpenCV /
-MediaPipe so the web process stays free — closing a tab does not stop a job.
+MediaPipe, overlay, PDF, and drill matching so the web process stays free —
+closing a tab does not stop a job.
+
+Train / admin catalog HTTP stays on the website API. This repo keeps a
+read-only copy of `app/coaching/drills.json` for matching after CV.
 
 ## Run locally
 

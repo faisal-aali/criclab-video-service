@@ -1,0 +1,10 @@
+---
+description: Read the video-service Memory Bank before coding in this repo
+alwaysApply: true
+---
+
+# Memory Bank (this repo)
+
+Before non-trivial work, read `memory-bank/`: `productBrief.md`, `techContext.md`, `systemPatterns.md` (highest priority), `roadmap.md`, relevant `tasks/`, `agent-rules/agent.md`.
+
+Sibling website API: `../criclab-web-backend` (queue insert, catalog HTTP, auth). Sibling UI: `../criclab-web-frontend`. Do not add JWT/CORS or Train admin routes here. CV measures; Gemma coaches from `status === ok` JSON only.
