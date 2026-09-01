@@ -18,4 +18,4 @@ Run Action and Ball-flight analysis in this repo so the website API only inserts
 
 ## Notes
 
-Admin edits to the website `drills.json` do not auto-sync here. A later Mongo catalog can unify them (out of scope for this task). GitHub Actions deploy for this repo is FEAT-027 (Planned).
+Admin edits to the website `drills.json` do not auto-sync here. A later Mongo catalog can unify them (out of scope for this task). GitHub Actions deploy for this repo is FEAT-027 (Done): push `main` → CI `compileall` → self-hosted `pull.sh` + `restart.sh`.

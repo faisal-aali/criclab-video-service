@@ -68,7 +68,7 @@ Same machine as the website API (EC2 / Lightsail). Clone to `/var/www/criclab-vi
 pm2 start deploy/ecosystem.config.cjs
 ```
 
-That starts health on `127.0.0.1:8001` and **two** worker processes. Do not expose `:8001` publicly. GitHub Actions deploy for this repo is not wired yet (FEAT-027).
+That starts health on `127.0.0.1:8001` and **two** worker processes. Do not expose `:8001` publicly. Push to `main` deploys via the self-hosted runner (FEAT-027): `deploy/pull.sh` then `deploy/restart.sh`.
 
 ## MongoDB (this process writes)
 
