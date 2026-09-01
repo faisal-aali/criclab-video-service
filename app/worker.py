@@ -12,6 +12,7 @@ import asyncio
 import logging
 import os
 import socket
+import time
 import traceback
 from datetime import timedelta
 from pathlib import Path
@@ -125,6 +126,30 @@ async def _requeue_stale() -> None:
     await get_db()["balltrack_jobs"].update_many(stale, reset)
 
 
+async def _queued_waiting() -> bool:
+    db = get_db()
+    if await db.jobs.find_one({"status": "queued"}, {"_id": 1}):
+        return True
+    if await db["balltrack_jobs"].find_one({"status": "queued"}, {"_id": 1}):
+        return True
+    return False
+
+
+def _stop_ec2_instance(instance_id: str, region: str) -> None:
+    import boto3
+
+    boto3.client("ec2", region_name=region).stop_instances(InstanceIds=[instance_id])
+
+
+async def _stop_idle_instance(instance_id: str, region: str) -> bool:
+    try:
+        await asyncio.to_thread(_stop_ec2_instance, instance_id, region)
+        return True
+    except Exception:
+        log.exception("failed to stop EC2 instance %s in %s", instance_id, region)
+        return False
+
+
 async def worker_loop() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     settings = get_settings()
@@ -134,6 +159,9 @@ async def worker_loop() -> None:
         raise SystemExit("MongoDB is not reachable")
     log.info("video worker %s waiting for jobs (db=%s)", WORKER_ID, settings.mongodb_db)
     ticks = 0
+    idle_since: float | None = None
+    idle_stop_s = max(1, int(settings.ec2_idle_stop_seconds))
+    instance_id = settings.ec2_instance_id
     while True:
         ticks += 1
         if ticks % 40 == 1:
@@ -144,8 +172,26 @@ async def worker_loop() -> None:
             job = await bt_repo.claim_next_job(WORKER_ID)
             kind = "ballflight"
         if job is None:
+            now = time.monotonic()
+            if idle_since is None:
+                idle_since = now
+            if instance_id and (now - idle_since) >= idle_stop_s:
+                if await _queued_waiting():
+                    idle_since = None
+                    continue
+                log.info(
+                    "idle %.0fs with empty queues; stopping %s (%s)",
+                    idle_stop_s,
+                    instance_id,
+                    settings.ec2_stop_region,
+                )
+                if await _stop_idle_instance(instance_id, settings.ec2_stop_region):
+                    log.info("stop requested; waiting for instance halt")
+                    await asyncio.Event().wait()
+                idle_since = now
             await asyncio.sleep(0.8)
             continue
+        idle_since = None
         job_id = job["_id"]
         log.info("claimed %s job %s", kind, job_id)
         try:

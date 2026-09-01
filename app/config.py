@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     bedrock_embedding_model_id: str = "amazon.titan-embed-text-v2:0"
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
+    ec2_instance_id: str | None = None
+    ec2_region: str | None = None
+    ec2_idle_stop_seconds: int = 60
     # Leave empty to use ~/.local/share/criclab (must match the website API).
     storage_dir: str = ""
     default_meters_per_pixel: float | None = None
@@ -45,6 +48,8 @@ class Settings(BaseSettings):
         "cloudinary_api_secret",
         "aws_access_key_id",
         "aws_secret_access_key",
+        "ec2_instance_id",
+        "ec2_region",
         mode="before",
     )
     @classmethod
@@ -66,6 +71,10 @@ class Settings(BaseSettings):
         if value in ("local", "dev", "development"):
             return "local"
         raise ValueError("APP_ENV must be 'local' or 'production'")
+
+    @property
+    def ec2_stop_region(self) -> str:
+        return (self.ec2_region or self.aws_region).strip()
 
     @property
     def is_production(self) -> bool:
