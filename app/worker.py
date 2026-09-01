@@ -161,7 +161,7 @@ async def worker_loop() -> None:
     ticks = 0
     idle_since: float | None = None
     idle_stop_s = max(1, int(settings.ec2_idle_stop_seconds))
-    instance_id = settings.ec2_instance_id
+    instance_id = settings.ec2_instance_id if settings.is_production else None
     while True:
         ticks += 1
         if ticks % 40 == 1:
