@@ -19,10 +19,6 @@ source .venv312/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # already filled locally; keep it gitignored
 
-# terminal 1 — optional health API on :8001
-uvicorn app.main:app --port 8001
-
-# terminal 2+ — one worker per process (run two for parallel clips)
 python -m app.worker
 ```
 
@@ -38,4 +34,4 @@ Clone to `/var/www/criclab-video-service`, copy `.env` (Mongo / Cloudinary /
 pm2 start deploy/ecosystem.config.cjs
 ```
 
-Two worker processes claim jobs independently.
+One worker process claims jobs (one clip at a time). Push to `main` deploys via the self-hosted runner.

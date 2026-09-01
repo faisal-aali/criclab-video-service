@@ -58,34 +58,28 @@ if ! command -v pm2 >/dev/null 2>&1; then
 fi
 
 echo "Deploy"
-if pm2 describe criclab-video-api >/dev/null 2>&1 \
-  && pm2 describe criclab-video-worker >/dev/null 2>&1; then
-  pm2 restart criclab-video-api criclab-video-worker --update-env
+pm2 delete criclab-video-api >/dev/null 2>&1 || true
+
+if pm2 describe criclab-video-worker >/dev/null 2>&1; then
+  pm2 restart criclab-video-worker --update-env
+  pm2 scale criclab-video-worker 1
 else
-  pm2 delete criclab-video-api >/dev/null 2>&1 || true
-  pm2 delete criclab-video-worker >/dev/null 2>&1 || true
-  # leftover from the current single criclab-video* process (id 2)
-  while read -r name; do
-    [[ -z "$name" ]] && continue
-    pm2 delete "$name" >/dev/null 2>&1 || true
-  done < <(pm2 jlist | python -c '
-import json,sys
-try:
-    apps=json.load(sys.stdin)
-except Exception:
-    raise SystemExit(0)
-for a in apps:
-    n=a.get("name") or ""
-    if n.startswith("criclab-video") and n not in ("criclab-video-api","criclab-video-worker"):
-        print(n)
-')
   pm2 start "${ROOT}/deploy/ecosystem.config.cjs"
 fi
 pm2 save
 
 ok=""
 for _ in $(seq 1 30); do
-  if curl -fsS --max-time 2 http://127.0.0.1:8001/health >/dev/null 2>&1; then
+  if pm2 jlist | python -c '
+import json, sys
+apps = json.load(sys.stdin)
+online = [
+    a for a in apps
+    if a.get("name") == "criclab-video-worker"
+    and (a.get("pm2_env") or {}).get("status") == "online"
+]
+sys.exit(0 if len(online) == 1 else 1)
+'; then
     ok=1
     break
   fi
@@ -93,13 +87,10 @@ for _ in $(seq 1 30); do
 done
 
 if [[ -z "$ok" ]]; then
-  echo "API did not listen on 127.0.0.1:8001:" >&2
-  pm2 describe criclab-video-api || true
-  pm2 logs criclab-video-api --nostream --lines 80 || true
+  echo "criclab-video-worker did not come online:" >&2
+  pm2 describe criclab-video-worker || true
   pm2 logs criclab-video-worker --nostream --lines 80 || true
   exit 1
 fi
 
-curl -fsS --max-time 10 http://127.0.0.1:8001/health
-echo
-echo "criclab-video-api and workers restarted from ${ROOT}"
+echo "criclab-video-worker restarted from ${ROOT}"

@@ -26,4 +26,4 @@ High-level features **this worker** runs. Website auth / Train HTTP / UI live in
 
 - Pipeline originally lived in `criclab-web-backend`. It now runs here so the website process stays free and closing a tab cannot stop a job.
 - **1 Sep 2026 (FEAT-026):** Drill matching (`weakness_tags`, `balltrack_tags`, hydrate) plus a read-only `drills.json` snapshot live in `app/coaching/`. Train / admin catalog HTTP stays on the website API. Failed Action jobs re-raise so the worker logs `job failed`, not `finished`.
-- **1 Sep 2026 (FEAT-027):** Same CI/deploy shape as the website API. `compileall` on GitHub; Deploy on the instance runner pulls `/var/www/criclab-video-service` and restarts `criclab-video-api` plus two `criclab-video-worker` processes. Health stays on `127.0.0.1:8001` (not public).
+- **1 Sep 2026 (FEAT-027):** Same CI/deploy shape as the website API. `compileall` on GitHub; Deploy on the instance runner pulls `/var/www/criclab-video-service` and restarts one `criclab-video-worker`. No PM2 health API.
