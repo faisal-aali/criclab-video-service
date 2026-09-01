@@ -62,7 +62,15 @@ pm2 delete criclab-video-api >/dev/null 2>&1 || true
 
 if pm2 describe criclab-video-worker >/dev/null 2>&1; then
   pm2 restart criclab-video-worker --update-env
-  pm2 scale criclab-video-worker 1
+  # Already at 1 instance → PM2 prints "Nothing to do" and exits 1.
+  count="$(pm2 jlist | python -c '
+import json, sys
+apps = json.load(sys.stdin)
+print(sum(1 for a in apps if a.get("name") == "criclab-video-worker"))
+')"
+  if [[ "$count" != "1" ]]; then
+    pm2 scale criclab-video-worker 1
+  fi
 else
   pm2 start "${ROOT}/deploy/ecosystem.config.cjs"
 fi
