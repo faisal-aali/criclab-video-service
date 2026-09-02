@@ -13,7 +13,7 @@ jobs:
   start:
     name: Start EC2 runner
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 2
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -36,30 +36,9 @@ jobs:
             --query 'Reservations[0].Instances[0].State.Name' \
             --output text)
           echo "state=${STATE}"
-          case "$STATE" in
-            stopped)
-              aws ec2 start-instances --instance-ids "$INSTANCE_ID"
-              aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
-              aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
-              echo "started"
-              ;;
-            running)
-              echo "already running"
-              ;;
-            stopping)
-              aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
-              aws ec2 start-instances --instance-ids "$INSTANCE_ID"
-              aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
-              aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
-              echo "started after stopping"
-              ;;
-            pending)
-              aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
-              aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
-              echo "was pending; now running"
-              ;;
-            *)
-              echo "cannot start from state ${STATE}"
-              exit 1
-              ;;
-          esac
+          if [ "$STATE" = "stopped" ]; then
+            aws ec2 start-instances --instance-ids "$INSTANCE_ID"
+            echo "start requested"
+          else
+            echo "skipped; not stopped"
+          fi
