@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     # Leave empty to use ~/.local/share/criclab (must match the website API).
     storage_dir: str = ""
     default_meters_per_pixel: float | None = None
+    # Same cap as the website API. Only this process increments the Mongo counter.
+    daily_video_quota: int = 60
 
     cloudinary_url: str | None = None
     cloudinary_cloud_name: str | None = None
@@ -61,6 +63,19 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             return v.strip()
         return v
+
+    @field_validator("daily_video_quota", mode="before")
+    @classmethod
+    def _daily_quota(cls, v: Any) -> int:
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return 60
+        try:
+            n = int(v)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("DAILY_VIDEO_QUOTA must be a positive integer") from exc
+        if n < 1:
+            raise ValueError("DAILY_VIDEO_QUOTA must be at least 1")
+        return n
 
     @field_validator("app_env", mode="before")
     @classmethod

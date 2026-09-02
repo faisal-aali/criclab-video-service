@@ -35,10 +35,13 @@ Same relative filenames (`agent/ollama_agent.py`, `balltrack/stumps.py`) are all
 
 - One process = one clip at a time (`python -m app.worker`).
 - Ingest always downloads `source_url` from Cloudinary into this process `STORAGE_DIR`. Never reuse Mongo `path` or a leftover local file (those paths are often from another machine).
-- Claims Action jobs first, then Ball-flight if the Action queue is empty.
+- Claims the oldest eligible job **across both collections** (`created_at` ASC). Action is not preferred over Ball-flight.
+- Before claim, take one slot on `quota_days` for the UTC day (`started < DAILY_VIDEO_QUOTA`). Fail and stale re-queue release today's slot; complete keeps it.
+- Skip jobs whose `available_at` is still in the future. Missing `available_at` is treated as eligible (pre-quota rows).
 - Parallel clips = more processes (production PM2 `criclab-video-worker` is `instances: 1`).
-- Stale `claimed` jobs older than 45 minutes are re-queued.
+- Stale `claimed` jobs older than 45 minutes are re-queued (and the day's slot is released).
 - `pipeline/runner.py` re-raises after writing `status=failed` so the worker logs `job failed`, not `finished`.
+- Production worker is a **separate** EC2 from the website API. Idle-stop when **nothing is claimable now** (empty queue, only tomorrow's `available_at`, or today's cap full). Do not stop while any job is `claimed` / `processing` / `analyzing`. The always-on API starts this instance at 00:00 UTC when leftover jobs become eligible.
 
 ## Two film modes (do not merge their numbers)
 
@@ -118,6 +121,7 @@ Python helpers the runner calls (not Ollama tool-calling):
 - Merging stump (Ball flight) speed into an Action job
 - Adding JWT, CORS, SMTP, or Train admin routes to this process
 - Importing `criclab-web-backend` packages as if they were this `app`
+- Claiming Action jobs before older Ball-flight jobs (FIFO is global)
 - Running MediaPipe on Python 3.13/3.14
 - Processing two clips in one worker process (run a second process instead)
 

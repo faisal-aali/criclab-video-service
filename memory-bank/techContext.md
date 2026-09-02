@@ -62,19 +62,21 @@ criclab-video-service/
 
 ## Production
 
-Same machine as the website API (EC2 / Lightsail). Clone to `/var/www/criclab-video-service`, matching Mongo / Cloudinary / `STORAGE_DIR`, then:
+Dedicated worker EC2 (not the website API/frontend box). Clone to `/var/www/criclab-video-service`, matching Mongo / Cloudinary / `STORAGE_DIR`, then:
 
 ```bash
 pm2 start deploy/ecosystem.config.cjs
 ```
 
-That starts **one** `criclab-video-worker` process. Push to `main` deploys via the self-hosted runner (FEAT-027): `deploy/pull.sh` then `deploy/restart.sh`. The website API stays on `:8000`; this worker has no public HTTP.
+That starts **one** `criclab-video-worker` process. Push to `main` deploys via the self-hosted runner (FEAT-027): `deploy/pull.sh` then `deploy/restart.sh`. The website API stays on the always-on box (`:8000`); this worker has no public HTTP. After `EC2_IDLE_STOP_SECONDS` with nothing claimable, this instance stops itself; the API starts it again when a clip can run (including 00:00 UTC).
 
 ## MongoDB (this process writes)
 
 | Collection | Role |
 |------------|------|
 | `jobs` / `balltrack_jobs` | Claim `queued` → `claimed` / progress / complete / fail |
+| `quota_days` | UTC-day start counter (`started`); this process leases/releases |
+| `quota_state` | `dirty_at` so the website API recomputes expected start times |
 | `deliveries` | Action analysis documents |
 | `balltrack_sessions` / `balltrack_deliveries` | Ball-flight session + per-ball docs |
 | `videos` | Read path / `source_url` (created by the website API) |

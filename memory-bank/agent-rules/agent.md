@@ -31,12 +31,13 @@ For non-trivial work:
 
 ## Implementation rules
 
-- This repo: claim `queued` jobs; MediaPipe/OpenCV; overlay; PDF; Gemma **video** notes; drill **matching**
+- This repo: claim `queued` jobs (global FIFO + daily `quota_days` lease); MediaPipe/OpenCV; overlay; PDF; Gemma **video** notes; drill **matching**
 - Catalog HTTP (Train / admin) stays in `criclab-web-backend` — do not add JWT, CORS, SMTP, or drill CRUD routes here
 - LLM: Ollama `gemma3:4b` locally or Bedrock in production; never measure frames
 - Persist deliveries in the **shared** MongoDB; the website API reads them
 - Label physical metrics as estimates unless calibrated + validated
 - One job per worker process; parallelism = more processes
+- Idle-stop the worker EC2 when nothing is claimable now; the website API starts it again (including 00:00 UTC)
 - Keep the three-repo split — do not add Vite/React sources here
 
 ## Demo prompts

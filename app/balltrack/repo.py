@@ -5,6 +5,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.db.mongo import get_db
+from app.db.quota import queued_eligible_filter
 
 
 def new_id(prefix: str) -> str:
@@ -82,10 +83,31 @@ async def get_job(job_id: str) -> dict[str, Any] | None:
 _ACTIVE = ("queued", "claimed", "processing", "analyzing")
 
 
+async def peek_oldest_queued(now: datetime | None = None) -> dict[str, Any] | None:
+    return await _col_jobs().find_one(queued_eligible_filter(now), sort=[("created_at", 1)])
+
+
+async def claim_job(job_id: str, worker_id: str, quota_day: str) -> dict[str, Any] | None:
+    now = utcnow()
+    return await _col_jobs().find_one_and_update(
+        {"_id": job_id, "status": "queued"},
+        {
+            "$set": {
+                "status": "claimed",
+                "worker_id": worker_id,
+                "quota_day": quota_day,
+                "message": "Assigned to a video worker",
+                "updated_at": now,
+            }
+        },
+        return_document=True,
+    )
+
+
 async def claim_next_job(worker_id: str) -> dict[str, Any] | None:
     now = utcnow()
     return await _col_jobs().find_one_and_update(
-        {"status": "queued"},
+        queued_eligible_filter(now),
         {
             "$set": {
                 "status": "claimed",

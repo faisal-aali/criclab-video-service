@@ -3,6 +3,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.db.mongo import get_db
+from app.db.quota import queued_eligible_filter
 
 
 def new_id(prefix: str) -> str:
@@ -102,11 +103,33 @@ async def get_video(video_id: str) -> dict[str, Any] | None:
 _ACTIVE = ("queued", "claimed", "processing", "analyzing")
 
 
-async def claim_next_job(worker_id: str) -> dict[str, Any] | None:
-    """Atomically take the oldest queued Action job. Safe across worker processes."""
+async def peek_oldest_queued(now: datetime | None = None) -> dict[str, Any] | None:
+    return await get_db().jobs.find_one(queued_eligible_filter(now), sort=[("created_at", 1)])
+
+
+async def claim_job(job_id: str, worker_id: str, quota_day: str) -> dict[str, Any] | None:
+    """Take a specific queued Action job after a quota lease has been won."""
     now = utcnow()
     return await get_db().jobs.find_one_and_update(
-        {"status": "queued"},
+        {"_id": job_id, "status": "queued"},
+        {
+            "$set": {
+                "status": "claimed",
+                "worker_id": worker_id,
+                "quota_day": quota_day,
+                "message": "Assigned to a video worker",
+                "updated_at": now,
+            }
+        },
+        return_document=True,
+    )
+
+
+async def claim_next_job(worker_id: str) -> dict[str, Any] | None:
+    """Atomically take the oldest eligible queued Action job. Safe across worker processes."""
+    now = utcnow()
+    return await get_db().jobs.find_one_and_update(
+        queued_eligible_filter(now),
         {
             "$set": {
                 "status": "claimed",

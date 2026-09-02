@@ -21,9 +21,11 @@ High-level features **this worker** runs. Website auth / Train HTTP / UI live in
 | FEAT-015 | Coaching memory | Planned | Embeddings over historical notes — not wired |
 | FEAT-016 | Validation | Planned | Radar / ground-truth; multi-view rotation + depth speed |
 | FEAT-027 | **CI/deploy for this repo** | Done | Push to `main` → GitHub Actions CI + self-hosted Deploy (`pull.sh` + `restart.sh` + PM2) |
+| FEAT-031 | **Daily video quota** | Done | Atomic `quota_days` lease; global FIFO claim; slot release on fail/stale |
 
 ## Change log
 
 - Pipeline originally lived in `criclab-web-backend`. It now runs here so the website process stays free and closing a tab cannot stop a job.
 - **1 Sep 2026 (FEAT-026):** Drill matching (`weakness_tags`, `balltrack_tags`, hydrate) plus a read-only `drills.json` snapshot live in `app/coaching/`. Train / admin catalog HTTP stays on the website API. Failed Action jobs re-raise so the worker logs `job failed`, not `finished`.
 - **1 Sep 2026 (FEAT-027):** Same CI/deploy shape as the website API. `compileall` on GitHub; Deploy on the instance runner pulls `/var/www/criclab-video-service` and restarts one `criclab-video-worker`. No PM2 health API.
+- **2 Sep 2026 (TASK-002 / FEAT-031):** Daily start cap. Claim the oldest eligible job across both collections after winning a `quota_days` lease. Fail and stale re-queue release today's slot. Idle-stop when nothing is claimable now; the website API starts this instance at 00:00 UTC for leftover FIFO jobs.
