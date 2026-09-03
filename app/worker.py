@@ -134,10 +134,31 @@ async def _requeue_stale_in(collection) -> None:
         await quota.mark_dirty()
 
 
+async def _fail_stale_running_in(collection) -> None:
+    cutoff = repo.utcnow() - timedelta(minutes=45)
+    now = repo.utcnow()
+    await collection.update_many(
+        {
+            "status": {"$in": ["processing", "analyzing"]},
+            "updated_at": {"$lt": cutoff},
+        },
+        {
+            "$set": {
+                "status": "failed",
+                "stage": "failed",
+                "message": "Analysis stopped before this clip finished. Upload it again.",
+                "updated_at": now,
+            }
+        },
+    )
+
+
 async def _requeue_stale() -> None:
     db = get_db()
     await _requeue_stale_in(db.jobs)
     await _requeue_stale_in(db["balltrack_jobs"])
+    await _fail_stale_running_in(db.jobs)
+    await _fail_stale_running_in(db["balltrack_jobs"])
 
 
 def _created_at(doc: dict) -> datetime:
