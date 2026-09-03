@@ -26,7 +26,7 @@ from app.db import quota, repository as repo
 from app.db.mongo import close_mongo, get_db, ping_mongo
 from app.pipeline.job_progress import JobReporter
 from app.pipeline.runner import run_analysis_job
-from app.services import s3_service
+from app.services import original_archive, s3_service
 
 log = logging.getLogger("criclab.video-worker")
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
@@ -152,7 +152,7 @@ async def _run_ballflight(job: dict) -> None:
 
 
 async def _requeue_stale_in(collection) -> None:
-    cutoff = repo.utcnow() - timedelta(minutes=45)
+    cutoff = repo.utcnow() - timedelta(hours=1)
     now = repo.utcnow()
     while True:
         doc = await collection.find_one_and_update(
@@ -174,12 +174,19 @@ async def _requeue_stale_in(collection) -> None:
 
 
 async def _fail_stale_running_in(collection) -> None:
-    cutoff = repo.utcnow() - timedelta(minutes=45)
+    cutoff = repo.utcnow() - timedelta(hours=1)
     now = repo.utcnow()
+    filt = {
+        "status": {"$in": ["processing", "analyzing"]},
+        "updated_at": {"$lt": cutoff},
+    }
+    docs = await collection.find(filt, {"_id": 1, "video_id": 1, "session_id": 1}).to_list(200)
+    if not docs:
+        return
     await collection.update_many(
         {
+            "_id": {"$in": [d["_id"] for d in docs]},
             "status": {"$in": ["processing", "analyzing"]},
-            "updated_at": {"$lt": cutoff},
         },
         {
             "$set": {
@@ -190,6 +197,11 @@ async def _fail_stale_running_in(collection) -> None:
             }
         },
     )
+    for job in docs:
+        try:
+            await original_archive.maybe_archive_for_job(job)
+        except Exception:
+            log.exception("glacier archive after stale fail %s", job.get("_id"))
 
 
 async def _requeue_stale() -> None:
@@ -198,6 +210,10 @@ async def _requeue_stale() -> None:
     await _requeue_stale_in(db["balltrack_jobs"])
     await _fail_stale_running_in(db.jobs)
     await _fail_stale_running_in(db["balltrack_jobs"])
+    try:
+        await original_archive.sweep_orphan_originals()
+    except Exception:
+        log.exception("glacier orphan sweep failed")
 
 
 def _created_at(doc: dict) -> datetime:
@@ -244,6 +260,11 @@ async def _finish_slot(job: dict, kind: str) -> None:
     day = (latest or {}).get("quota_day") or job.get("quota_day")
     if status == "failed":
         await quota.release_lease(day)
+    if status in ("completed", "failed"):
+        try:
+            await original_archive.maybe_archive_for_job(latest or job)
+        except Exception:
+            log.exception("glacier archive after %s %s", status, job_id)
     await quota.mark_dirty()
 
 

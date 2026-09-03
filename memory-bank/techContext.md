@@ -52,7 +52,7 @@ criclab-video-service/
 │   ├── coaching/         # matching + read-only drills.json snapshot
 │   ├── agent/            # Gemma video notes (not the website chat assistant)
 │   ├── pdf/              # report + charts
-│   ├── services/         # S3 download / overlay+PDF upload
+│   ├── services/         # S3 download / overlay+PDF upload / Glacier originals
 │   ├── db/               # Mongo (shared)
 │   └── main.py           # optional local health only — not run in production PM2
 ├── memory-bank/
@@ -89,4 +89,5 @@ That starts **one** `criclab-video-worker` process. Push to `main` deploys via t
 - Mongo, S3, and `STORAGE_DIR` must match the website API
 - Never merge Ball-flight stump speed into an Action pose job
 - Do not add CloudFront signing or `CLOUDFRONT_*` env here — persist object keys only
-- Playback encode is ffmpeg 1280×720 / 30 fps / 1 Mbps (`imageio-ffmpeg`); CV always uses the original file
+- Playback encode is ffmpeg 1280×720 / 30 fps / 1.5 Mbps (`imageio-ffmpeg`); CV always uses the original file
+- After a job is `completed` or `failed`, this process CopyObjects `original/` to Glacier Flexible Retrieval (`GLACIER`). IAM needs GetObject + PutObject + HeadObject on `original/*`. 90-day minimum storage charge. Do not RestoreObject.

@@ -35,13 +35,17 @@ Same relative filenames (`agent/ollama_agent.py`, `balltrack/stumps.py`) are all
 
 - One process = one clip at a time (`python -m app.worker`).
 - Ingest downloads `source_key` from S3 (`GetObject`) into this process `STORAGE_DIR`. Never reuse Mongo `path` from another machine when a key is present. Local `path` is only for multipart uploads when S3 is not configured.
-- After download, ffmpeg writes `compressed/{id}.mp4` (1280×720, 30 fps, 1 Mbps H.264). Pose / ball-flight always run on the **original**, never the compressed file.
+- After download, ffmpeg writes `compressed/{id}.mp4` (1280×720, 30 fps, 1.5 Mbps H.264). Pose / ball-flight always run on the **original**, never the compressed file.
 - This process never mints CloudFront URLs and does not need the CloudFront private key. Persist object keys only.
 - Claims the oldest eligible job **across both collections** (`created_at` ASC). Action is not preferred over Ball-flight.
 - Before claim, take one slot on `quota_days` for the UTC day (`started < DAILY_VIDEO_QUOTA`). Fail and stale re-queue release today's slot; complete keeps it.
 - Skip jobs whose `available_at` is still in the future. Missing `available_at` is treated as eligible (pre-quota rows).
 - Parallel clips = more processes (production PM2 `criclab-video-worker` is `instances: 1`).
-- Stale `claimed` jobs older than 45 minutes are re-queued (and the day's slot is released).
+- Stale `claimed` jobs older than 1 hour are re-queued (and the day's slot is released). Do not Glacier those originals.
+- Stale `processing` / `analyzing` (1 hour) become `failed` and the original is archived.
+- After `_finish_slot` sees `completed` or `failed`, `original_archive.maybe_archive_for_job` CopyObjects `source_key` to Glacier Flexible Retrieval (`GLACIER`) unless another live job shares the key. Failures must not fail the job.
+- `GetObject` `InvalidObjectState` → fail the job (do not RestoreObject).
+- Orphan sweep on the stale tick: all jobs for a `source_key` are terminal but the object is still Standard (in-flight cancel + dead worker).
 - `pipeline/runner.py` re-raises after writing `status=failed` so the worker logs `job failed`, not `finished`.
 - Production worker is a **separate** EC2 from the website API. Idle-stop when **nothing is claimable now** (empty queue, only tomorrow's `available_at`, or today's cap full). Do not stop while any job is `claimed` / `processing` / `analyzing`. The always-on API starts this instance at 00:00 UTC when leftover jobs become eligible.
 
@@ -98,7 +102,7 @@ Add a metric by extending the metrics stage + JSON. UI cards live in `criclab-we
 
 - Overlay burns onto **original colour** frames. Tiles match metrics JSON (`—` if status ≠ ok). One ball speed per delivery — never a per-frame label that contradicts the headline.
 - PDF is SpinLab-style cricket pages + catalog drill URLs as **text** (no iframes).
-- Overlay render stays OpenCV (30 fps, max width 1280); ffmpeg then enforces 1280×720 + 1 Mbps for S3 `overlays/` (and Ball-flight clips). Same encode for `compressed/`.
+- Overlay render stays OpenCV (30 fps, max width 1280); ffmpeg then enforces 1280×720 + 1.5 Mbps for S3 `overlays/` (and Ball-flight clips). Same encode for `compressed/`.
 - Overlay/PDF S3 upload failures must not fail the job; fall back to local `/artifacts/...`.
 
 ## Coaching (matching, not catalog HTTP)
@@ -129,6 +133,9 @@ Python helpers the runner calls (not Ollama tool-calling):
 - Processing two clips in one worker process (run a second process instead)
 - Minting CloudFront URLs or storing `CLOUDFRONT_*` env on this box
 - Running pose / ball-flight on the compressed 720p file (always use the original)
+- Age-based lifecycle on `original/` (a queued job can outlive 7 days)
+- RestoreObject / hours-long thaw as the normal ingest path
+- Archiving `compressed/` / `overlays/` / `files/`
 
 ## MVP workflow checklist
 

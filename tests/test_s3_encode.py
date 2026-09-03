@@ -48,7 +48,7 @@ class FfmpegArgvTests(unittest.TestCase):
         self.assertEqual(argv[0], "ffmpeg")
         self.assertIn("-r", argv)
         self.assertIn("30", argv)
-        self.assertIn("1000k", argv)
+        self.assertIn("1500k", argv)
         self.assertIn("-minrate", argv)
         self.assertIn("nal-hrd=cbr", argv)
         self.assertIn("libx264", argv)

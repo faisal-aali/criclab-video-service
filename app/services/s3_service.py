@@ -7,6 +7,7 @@ API signs GET URLs at read time.
 from __future__ import annotations
 
 import inspect
+import logging
 import mimetypes
 import subprocess
 from pathlib import Path
@@ -14,7 +15,11 @@ from typing import Any
 
 from app.config import get_settings
 
+log = logging.getLogger("criclab.s3")
+
 PREFIXES = ("original/", "compressed/", "overlays/", "files/")
+ARCHIVED_STORAGE_CLASSES = frozenset({"GLACIER", "DEEP_ARCHIVE", "GLACIER_IR"})
+GLACIER_FLEXIBLE = "GLACIER"
 _GENERIC_CONTENT_TYPES = frozenset(
     {"", "application/octet-stream", "binary/octet-stream"}
 )
@@ -84,6 +89,74 @@ def is_our_object_key(key: str | None) -> bool:
     return any(k.startswith(p) for p in PREFIXES)
 
 
+class ArchivedOriginalError(ValueError):
+    """GetObject on a Glacier original — do not RestoreObject."""
+
+
+def original_object_key(key: str | None) -> str | None:
+    """`original/…` only. None if missing or not one of ours."""
+    k = (key or "").strip().lstrip("/")
+    if not is_our_object_key(k) or not k.startswith("original/"):
+        return None
+    return k
+
+
+def is_archived_storage_class(value: str | None) -> bool:
+    return (value or "").upper() in ARCHIVED_STORAGE_CLASSES
+
+
+def _s3_error_code(exc: BaseException) -> str:
+    resp = getattr(exc, "response", None)
+    if not isinstance(resp, dict):
+        return ""
+    return str((resp.get("Error") or {}).get("Code") or "")
+
+
+def head_original(key: str) -> dict[str, Any] | None:
+    """Storage class for an original. None if S3 is off or the object is missing."""
+    k = original_object_key(key)
+    if not k or not s3_configured():
+        return None
+    try:
+        obj = _s3_client().head_object(Bucket=get_settings().s3_bucket, Key=k)
+    except Exception as exc:
+        if _s3_error_code(exc) in {"404", "NoSuchKey", "NotFound"}:
+            log.info("original missing at %s", k)
+            return None
+        log.warning("head_original failed for %s: %s", k, exc)
+        return None
+    return {
+        "key": k,
+        "storage_class": (obj.get("StorageClass") or "STANDARD").upper(),
+    }
+
+
+def archive_original(key: str) -> str | None:
+    """Same-key CopyObject to Glacier Flexible Retrieval. None if skipped or failed."""
+    k = original_object_key(key)
+    if not k or not s3_configured():
+        return None
+    head = head_original(k)
+    if head is None:
+        return None
+    if is_archived_storage_class(head.get("storage_class")):
+        return str(head["storage_class"])
+    bucket = get_settings().s3_bucket
+    try:
+        _s3_client().copy_object(
+            Bucket=bucket,
+            Key=k,
+            CopySource={"Bucket": bucket, "Key": k},
+            StorageClass=GLACIER_FLEXIBLE,
+            MetadataDirective="COPY",
+        )
+    except Exception:
+        log.exception("glacier copy failed for %s", k)
+        return None
+    log.info("archived original %s → %s", k, GLACIER_FLEXIBLE)
+    return GLACIER_FLEXIBLE
+
+
 def resolve_content_type(name_or_key: str, hint: str | None = None) -> str:
     """Pick a MIME type from a filename/object key, with an optional caller hint."""
     hinted = (hint or "").strip().lower()
@@ -115,13 +188,13 @@ def ffmpeg_argv(src: Path, dest: Path) -> list[str]:
         "-c:v",
         "libx264",
         "-b:v",
-        "1000k",
+        "1500k",
         "-minrate",
-        "1000k",
+        "1500k",
         "-maxrate",
-        "1000k",
+        "1500k",
         "-bufsize",
-        "2000k",
+        "3000k",
         "-x264-params",
         "nal-hrd=cbr",
         "-vf",
@@ -162,7 +235,7 @@ def upload_file(
 
 
 def encode_and_upload_video(src: Path, key: str) -> str | None:
-    """H.264 1280×720 30 fps 1 Mbps, then PutObject. Replaces src on success."""
+    """H.264 1280×720 30 fps 1.5 Mbps, then PutObject. Replaces src on success."""
     encoded = src.with_name(f"{src.stem}_h264.mp4")
     transcode_playback(src, encoded)
     uploaded = upload_file(encoded, key, "video/mp4")
@@ -187,7 +260,13 @@ async def download_object(
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.unlink(missing_ok=True)
     client = _s3_client()
-    obj = await _to_thread(client.get_object, Bucket=get_settings().s3_bucket, Key=k)
+    try:
+        obj = await _to_thread(client.get_object, Bucket=get_settings().s3_bucket, Key=k)
+    except Exception as exc:
+        if _s3_error_code(exc) == "InvalidObjectState":
+            dest.unlink(missing_ok=True)
+            raise ArchivedOriginalError("This clip is no longer available to analyse") from exc
+        raise
     body = obj["Body"]
     total = int(obj.get("ContentLength") or 0) or None
     written = 0
