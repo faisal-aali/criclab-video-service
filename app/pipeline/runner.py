@@ -3,8 +3,8 @@
 Order (see memory-bank/systemPatterns.md):
   extract meta → pose estimation → action/release detection → scale
     → (best-effort) ball tracking → biomechanics metrics
-      → slow-motion overlay video → Cloudinary upload
-        → Gemma coaching narrative → Cric-Lab PDF → Cloudinary upload
+      → slow-motion overlay video → S3 overlay
+        → Gemma coaching narrative → Cric-Lab PDF → S3 files
           → persist MongoDB delivery.
 """
 
@@ -28,7 +28,7 @@ from app.pipeline import render as render_mod
 from app.pipeline import timebase, track
 from app.pipeline.job_progress import JobReporter, clamp_counts
 from app.pipeline.view import flight_is_trackable
-from app.services import cloudinary_service
+from app.services import s3_service
 
 
 async def run_analysis_job(
@@ -199,17 +199,19 @@ async def run_analysis_job(
             on_progress=on_render,
         )
 
-        # --- Upload processed video to Cloudinary ---
+        # --- Encode + upload processed video ---
         await progress.aset("upload", 0, "Saving your processed clip", force=True)
-        cloud: dict[str, Any] = {"configured": cloudinary_service.is_configured()}
+        overlay_key = f"overlays/{job_id}_overlay.mp4"
+        pdf_key = f"files/{job_id}_report.pdf"
+        storage: dict[str, Any] = {"configured": s3_service.is_configured()}
         try:
-            vres = await asyncio.to_thread(
-                cloudinary_service.upload_video, overlay_video_path, f"{job_id}_overlay"
+            uploaded = await asyncio.to_thread(
+                s3_service.encode_and_upload_video, overlay_video_path, overlay_key
             )
-            if vres:
-                cloud["video"] = vres
+            if uploaded:
+                storage["overlay_key"] = uploaded
         except Exception as e:  # never fail the whole job on upload error
-            cloud["video_error"] = str(e)
+            storage["video_error"] = str(e)
 
         # --- Agent narrative ---
         await progress.aset("agent", 0, "Writing your coaching notes", status="analyzing", force=True)
@@ -240,11 +242,18 @@ async def run_analysis_job(
             stills_dir=stills_dir if stills_dir.exists() else None,
         )
         try:
-            pres = cloudinary_service.upload_pdf(pdf_path, public_id=f"{job_id}_report")
-            if pres:
-                cloud["pdf"] = pres
+            if pdf_path.is_file():
+                uploaded_pdf = await asyncio.to_thread(
+                    s3_service.upload_file,
+                    pdf_path,
+                    pdf_key,
+                    "application/pdf",
+                    content_disposition='attachment; filename="bowling_report.pdf"',
+                )
+                if uploaded_pdf:
+                    storage["pdf_key"] = uploaded_pdf
         except Exception as e:
-            cloud["pdf_error"] = str(e)
+            storage["pdf_error"] = str(e)
 
         # --- Persist ---
         delivery_id = repo.new_id("del")
@@ -263,14 +272,14 @@ async def run_analysis_job(
             "metrics": _strip_metric_series(metrics),
             "analysis": analysis,
             "render": render_info,
-            "cloudinary": cloud,
+            "storage": storage,
             "artifacts": {
                 "release_still": str(release_still_path),
                 "overlay_video": str(overlay_video_path),
                 "stills_dir": str(stills_dir),
                 "pdf": str(pdf_path),
-                "cloudinary_video_url": (cloud.get("video") or {}).get("playback_url"),
-                "cloudinary_pdf_url": (cloud.get("pdf") or {}).get("secure_url"),
+                "overlay_key": storage.get("overlay_key"),
+                "pdf_key": storage.get("pdf_key"),
             },
         }
         await repo.insert_delivery(delivery)
@@ -284,8 +293,8 @@ async def run_analysis_job(
                 "overlay_video_url": f"/artifacts/{job_id}/overlay.mp4",
                 "pdf_url": f"/artifacts/{job_id}/bowling_report.pdf",
                 "release_still_url": f"/artifacts/{job_id}/release.jpg",
-                "cloudinary_video_url": (cloud.get("video") or {}).get("playback_url"),
-                "cloudinary_pdf_url": (cloud.get("pdf") or {}).get("secure_url"),
+                "overlay_key": storage.get("overlay_key"),
+                "pdf_key": storage.get("pdf_key"),
             },
         )
     except Exception as e:

@@ -1,7 +1,7 @@
 """Dedicated video workers. Each process claims one Mongo job at a time.
 
 The website API only inserts `status=queued` rows. These processes download
-clips from Cloudinary, run MediaPipe/OpenCV, and write progress back to the
+clips from S3, run MediaPipe/OpenCV, and write progress back to the
 same job documents.
 Closing a browser tab cannot stop a claimed job.
 """
@@ -16,7 +16,6 @@ import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlparse
 
 from pymongo import ReturnDocument
 
@@ -27,16 +26,16 @@ from app.db import quota, repository as repo
 from app.db.mongo import close_mongo, get_db, ping_mongo
 from app.pipeline.job_progress import JobReporter
 from app.pipeline.runner import run_analysis_job
-from app.services import cloudinary_service
+from app.services import s3_service
 
 log = logging.getLogger("criclab.video-worker")
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
 _VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
 
-def _ingest_dest(record_id: str, source_url: str, *, balltrack: bool) -> Path:
+def _ingest_dest(record_id: str, source_key: str, *, balltrack: bool) -> Path:
     """Write under this process STORAGE_DIR — never Mongo's path (other machines)."""
-    suffix = Path(urlparse(source_url).path).suffix.lower() or ".mp4"
+    suffix = Path(source_key).suffix.lower() or ".mp4"
     if suffix not in _VIDEO_SUFFIXES:
         suffix = ".mp4"
     root = get_settings().storage_path
@@ -44,35 +43,65 @@ def _ingest_dest(record_id: str, source_url: str, *, balltrack: bool) -> Path:
     return folder / f"{record_id}{suffix}"
 
 
-async def _fetch_cloudinary_video(
-    source_url: str | None, record_id: str, job_id: str, *, balltrack: bool
+async def _fetch_source_video(
+    source_key: str | None,
+    record_id: str,
+    job_id: str,
+    *,
+    balltrack: bool,
+    local_path: str | None = None,
 ) -> Path:
-    url = (source_url or "").strip()
-    if not url:
-        raise FileNotFoundError("Clip has no Cloudinary source_url")
-    if not cloudinary_service.is_cloudinary_url(url):
-        raise ValueError("source_url is not a Cloudinary URL")
-    dest = _ingest_dest(record_id, url, balltrack=balltrack)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.unlink(missing_ok=True)
-    progress = JobReporter(job_id, update=bt_repo.update_job if balltrack else None)
-    await progress.aset("ingest", 0, "Fetching your clip", force=True)
-    log.info("downloading %s → %s", url, dest)
+    key = (source_key or "").strip().lstrip("/")
+    if key and s3_service.s3_configured():
+        if not s3_service.is_our_object_key(key):
+            raise ValueError("source_key is not an S3 object key")
+        dest = _ingest_dest(record_id, key, balltrack=balltrack)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.unlink(missing_ok=True)
+        progress = JobReporter(job_id, update=bt_repo.update_job if balltrack else None)
+        await progress.aset("ingest", 0, "Fetching your clip", force=True)
+        log.info("downloading s3://%s → %s", key, dest)
 
-    async def on_dl(written: int, total: int | None) -> None:
-        tot = int(total or 0)
-        frac = (written / tot) if tot else 0.0
-        mb_w = written / (1024 * 1024)
-        if tot:
-            msg = f"Fetching your clip — {mb_w:.1f} of {tot / (1024 * 1024):.1f} MB"
-            detail = {"current": written, "total": tot, "unit": "bytes"}
+        async def on_dl(written: int, total: int | None) -> None:
+            tot = int(total or 0)
+            frac = (written / tot) if tot else 0.0
+            mb_w = written / (1024 * 1024)
+            if tot:
+                msg = f"Fetching your clip — {mb_w:.1f} of {tot / (1024 * 1024):.1f} MB"
+                detail = {"current": written, "total": tot, "unit": "bytes"}
+            else:
+                msg = f"Fetching your clip — {mb_w:.1f} MB"
+                detail = {"current": written, "total": written, "unit": "bytes"}
+            await progress.aset("ingest", frac, msg, detail=detail)
+
+        await s3_service.download_object(key, dest, on_progress=on_dl)
+        return dest
+    if local_path:
+        path = Path(local_path)
+        if path.is_file():
+            return path
+    raise FileNotFoundError("Clip has no S3 source_key")
+
+
+async def _store_compressed(local: Path, record_id: str, *, balltrack: bool) -> str | None:
+    if not s3_service.s3_configured():
+        return None
+    compressed_key = f"compressed/{record_id}.mp4"
+    encoded = local.with_name(f"{local.stem}_compressed.mp4")
+    try:
+        await asyncio.to_thread(s3_service.transcode_playback, local, encoded)
+        uploaded = await asyncio.to_thread(
+            s3_service.upload_file, encoded, compressed_key, "video/mp4"
+        )
+    except Exception:
+        log.exception("compressed upload failed for %s", record_id)
+        return None
+    if uploaded:
+        if balltrack:
+            await bt_repo.update_session(record_id, compressed_key=uploaded)
         else:
-            msg = f"Fetching your clip — {mb_w:.1f} MB"
-            detail = {"current": written, "total": written, "unit": "bytes"}
-        await progress.aset("ingest", frac, msg, detail=detail)
-
-    await cloudinary_service.download_to_path(url, dest, on_progress=on_dl)
-    return dest
+            await repo.update_video(record_id, compressed_key=uploaded)
+    return uploaded
 
 
 async def _run_action(job: dict) -> None:
@@ -80,9 +109,14 @@ async def _run_action(job: dict) -> None:
     video = await repo.get_video(job["video_id"])
     if not video:
         raise ValueError("Video record missing")
-    dest = await _fetch_cloudinary_video(
-        video.get("source_url"), video["_id"], job_id, balltrack=False
+    dest = await _fetch_source_video(
+        video.get("source_key"),
+        video["_id"],
+        job_id,
+        balltrack=False,
+        local_path=video.get("path"),
     )
+    await _store_compressed(dest, video["_id"], balltrack=False)
     profile = video.get("player_profile") or {}
     await run_analysis_job(
         job_id=job_id,
@@ -101,9 +135,14 @@ async def _run_ballflight(job: dict) -> None:
     session = await bt_repo.get_session(job["session_id"])
     if not session:
         raise ValueError("Session record missing")
-    dest = await _fetch_cloudinary_video(
-        session.get("source_url"), session["_id"], job_id, balltrack=True
+    dest = await _fetch_source_video(
+        session.get("source_key"),
+        session["_id"],
+        job_id,
+        balltrack=True,
+        local_path=session.get("path"),
     )
+    await _store_compressed(dest, session["_id"], balltrack=True)
     await run_balltrack_job(
         job_id=job_id,
         session_id=session["_id"],

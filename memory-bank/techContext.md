@@ -15,7 +15,7 @@ This repo claims Mongo jobs and runs computer vision, overlay, PDF, and Gemma vi
 | Charts | matplotlib (Agg) | PDF charts |
 | PDF | ReportLab | SpinLab-style bowling report |
 | Video LLM | Ollama `gemma3:4b` (local) or Bedrock (production) | Coaching narrative + catalog drill IDs |
-| Storage | Cloudinary + local `STORAGE_DIR` | Source download, overlay + PDF upload |
+| Storage | S3 + local `STORAGE_DIR` | Source download, overlay + PDF upload. CloudFront signing is the website API |
 | DB | MongoDB (shared with website API) | Job progress, delivery writes |
 
 ## Python environment
@@ -35,7 +35,7 @@ python -m app.worker
 Vite React (upload)
   → website FastAPI inserts queued job + video/session row
     → this worker claims the job
-      → pose / ball-flight → metrics → overlay → Cloudinary
+      → pose / ball-flight → metrics → overlay → S3
         → Gemma notes + drill matching (local drills.json)
           → PDF → Mongo delivery
             → React polls website API for results
@@ -52,7 +52,7 @@ criclab-video-service/
 │   ├── coaching/         # matching + read-only drills.json snapshot
 │   ├── agent/            # Gemma video notes (not the website chat assistant)
 │   ├── pdf/              # report + charts
-│   ├── services/         # Cloudinary download / overlay+PDF upload
+│   ├── services/         # S3 download / overlay+PDF upload
 │   ├── db/               # Mongo (shared)
 │   └── main.py           # optional local health only — not run in production PM2
 ├── memory-bank/
@@ -62,7 +62,7 @@ criclab-video-service/
 
 ## Production
 
-Dedicated worker EC2 (not the website API/frontend box). Clone to `/var/www/criclab-video-service`, matching Mongo / Cloudinary / `STORAGE_DIR`, then:
+Dedicated worker EC2 (not the website API/frontend box). Clone to `/var/www/criclab-video-service`, matching Mongo / S3 / `STORAGE_DIR`, then:
 
 ```bash
 pm2 start deploy/ecosystem.config.cjs
@@ -79,12 +79,14 @@ That starts **one** `criclab-video-worker` process. Push to `main` deploys via t
 | `quota_state` | `dirty_at` so the website API recomputes expected start times |
 | `deliveries` | Action analysis documents |
 | `balltrack_sessions` / `balltrack_deliveries` | Ball-flight session + per-ball docs |
-| `videos` | Read path / `source_url` (created by the website API) |
+| `videos` | `source_key` (`original/…`); worker writes `compressed_key` |
 
 ## Constraints
 
 - Do not put frame measurement in Gemma
 - Do not add JWT, CORS, SMTP, or Train/admin drill CRUD here
 - Catalog HTTP stays on the website API; this repo keeps a **copy** of `drills.json` for matching (admin edits do not auto-sync)
-- Mongo, Cloudinary, and `STORAGE_DIR` must match the website API
+- Mongo, S3, and `STORAGE_DIR` must match the website API
 - Never merge Ball-flight stump speed into an Action pose job
+- Do not add CloudFront signing or `CLOUDFRONT_*` env here — persist object keys only
+- Playback encode is ffmpeg 1280×720 / 30 fps / 1 Mbps (`imageio-ffmpeg`); CV always uses the original file

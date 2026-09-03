@@ -1,29 +1,21 @@
-"""Cloudinary uploads for ball-track artifacts. Uses existing helpers; pose paths unchanged."""
+"""S3 uploads for ball-track artifacts. Pose overlay path is unchanged."""
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
-from app.services import cloudinary_service
-
-FOLDER = "criclab/balltrack"
+from app.services import s3_service
 
 
-def upload_video(path: Path, public_id: str) -> dict[str, Any] | None:
-    return cloudinary_service.upload_video(path, public_id, folder=FOLDER)
-
-
-def upload_image(path: Path, public_id: str) -> dict[str, Any] | None:
-    if not cloudinary_service.is_configured():
+def upload_video(path: Path, key: str) -> str | None:
+    try:
+        return s3_service.encode_and_upload_video(path, key)
+    except Exception:
         return None
-    import cloudinary.uploader
 
-    res = cloudinary.uploader.upload(
-        str(path),
-        resource_type="image",
-        public_id=public_id,
-        folder=FOLDER,
-        overwrite=True,
-    )
-    return {"secure_url": res.get("secure_url"), "public_id": res.get("public_id")}
+
+def upload_image(path: Path, key: str, content_type: str = "image/png") -> str | None:
+    try:
+        return s3_service.upload_file(path, key, content_type)
+    except Exception:
+        return None

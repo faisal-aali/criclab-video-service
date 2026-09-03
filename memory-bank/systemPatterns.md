@@ -15,16 +15,16 @@ Action pipeline order:
 ```text
 Claim queued job → Extract meta → POSE → Action/release → Calibrate
   → Best-effort ball track → Metrics JSON → Slow-mo overlay
-  → Cloudinary overlay → Gemma narrative + drill matching
-  → PDF → Cloudinary PDF → Persist delivery → job completed
+  → S3 overlay → Gemma narrative + drill matching
+  → PDF → S3 files/ → Persist delivery → job completed
 ```
 
 ## Three processes (do not treat `app` as one package)
 
 | Process | Repo | Owns |
 |---------|------|------|
-| Website API | `criclab-web-backend` | Auth, upload, insert `queued` jobs, job/delivery **reads**, stump *still* calibration, signed Cloudinary upload, chat assistant, Train catalog HTTP, bookings |
-| Video worker | **this repo** | Everything after claim: MediaPipe/OpenCV, metrics, overlay, PDF, Gemma *video* notes, drill matching, overlay/PDF upload, delivery **writes** |
+| Website API | `criclab-web-backend` | Auth, upload, insert `queued` jobs, job/delivery **reads**, stump *still* calibration, S3 presigned PUT + CloudFront signed GET, chat assistant, Train catalog HTTP, bookings |
+| Video worker | **this repo** | Everything after claim: MediaPipe/OpenCV, metrics, overlay, PDF, Gemma *video* notes, drill matching, overlay/PDF S3 upload, delivery **writes** |
 | UI | `criclab-web-frontend` | Display API JSON only |
 
 `app.coaching` **here** is matching (`weakness_tags`, `balltrack_tags`, hydrate) plus a read-only `drills.json` snapshot. `app.coaching` on the website API is catalog I/O (`load_catalog` / `save_catalog`). They are not the same package. Admin edits on the website do not auto-sync here.
@@ -34,7 +34,9 @@ Same relative filenames (`agent/ollama_agent.py`, `balltrack/stumps.py`) are all
 ## Worker loop
 
 - One process = one clip at a time (`python -m app.worker`).
-- Ingest always downloads `source_url` from Cloudinary into this process `STORAGE_DIR`. Never reuse Mongo `path` or a leftover local file (those paths are often from another machine).
+- Ingest downloads `source_key` from S3 (`GetObject`) into this process `STORAGE_DIR`. Never reuse Mongo `path` from another machine when a key is present. Local `path` is only for multipart uploads when S3 is not configured.
+- After download, ffmpeg writes `compressed/{id}.mp4` (1280×720, 30 fps, 1 Mbps H.264). Pose / ball-flight always run on the **original**, never the compressed file.
+- This process never mints CloudFront URLs and does not need the CloudFront private key. Persist object keys only.
 - Claims the oldest eligible job **across both collections** (`created_at` ASC). Action is not preferred over Ball-flight.
 - Before claim, take one slot on `quota_days` for the UTC day (`started < DAILY_VIDEO_QUOTA`). Fail and stale re-queue release today's slot; complete keeps it.
 - Skip jobs whose `available_at` is still in the future. Missing `available_at` is treated as eligible (pre-quota rows).
@@ -84,7 +86,7 @@ torso, fence, or a stationary tree is not a ball track: return null + reason.
 | Ball (Action, opt.) | `pipeline/detect.py` + `track.py` |
 | Metrics | `pipeline/metrics.py` |
 | Render | `pipeline/render.py` |
-| Upload | `services/cloudinary_service.py` |
+| Upload | `services/s3_service.py` |
 | Agent | `agent/ollama_agent.py` |
 | Matching | `coaching/recommend.py` + `drills.json` |
 | PDF | `pdf/report.py` + `pdf/charts.py` |
@@ -96,7 +98,8 @@ Add a metric by extending the metrics stage + JSON. UI cards live in `criclab-we
 
 - Overlay burns onto **original colour** frames. Tiles match metrics JSON (`—` if status ≠ ok). One ball speed per delivery — never a per-frame label that contradicts the headline.
 - PDF is SpinLab-style cricket pages + catalog drill URLs as **text** (no iframes).
-- Cloudinary overlay/PDF upload failures must not fail the job; fall back to local `/artifacts/...`.
+- Overlay render stays OpenCV (30 fps, max width 1280); ffmpeg then enforces 1280×720 + 1 Mbps for S3 `overlays/` (and Ball-flight clips). Same encode for `compressed/`.
+- Overlay/PDF S3 upload failures must not fail the job; fall back to local `/artifacts/...`.
 
 ## Coaching (matching, not catalog HTTP)
 
@@ -124,13 +127,16 @@ Python helpers the runner calls (not Ollama tool-calling):
 - Claiming Action jobs before older Ball-flight jobs (FIFO is global)
 - Running MediaPipe on Python 3.13/3.14
 - Processing two clips in one worker process (run a second process instead)
+- Minting CloudFront URLs or storing `CLOUDFRONT_*` env on this box
+- Running pose / ball-flight on the compressed 720p file (always use the original)
 
 ## MVP workflow checklist
 
 1. Website API inserts `queued` job
 2. This worker claims it
-3. Pose → action → scale → track → metrics
-4. Overlay + Cloudinary
-5. Gemma notes + catalog drills
-6. PDF + Cloudinary
-7. Persist delivery; website API serves results
+3. `GetObject` original → ffmpeg `compressed/` (playback only)
+4. Pose → action → scale → track → metrics (on the original)
+5. Overlay + S3 `overlays/`
+6. Gemma notes + catalog drills
+7. PDF + S3 `files/`
+8. Persist delivery keys; website API signs CloudFront GET at read time

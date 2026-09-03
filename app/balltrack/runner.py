@@ -107,8 +107,9 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
                 bowler_box=calibration.get("bowler"),
                 batter_box=calibration.get("batter"),
             )
-            clip_cloud = cloud.upload_video(clip_path, f"{job_id}_ball_{i + 1}")
-            clip_url = (clip_cloud or {}).get("playback_url") or f"/balltrack/media/{job_id}/ball_{i + 1}.mp4"
+            clip_key = f"overlays/{job_id}_ball_{i + 1}.mp4"
+            uploaded_clip = cloud.upload_video(clip_path, clip_key)
+            clip_url = f"/balltrack/media/{job_id}/ball_{i + 1}.mp4"
             bounce = metrics.get("bounce") or {}
             doc = {
                 "_id": did,
@@ -132,7 +133,7 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
                 "artifacts": {
                     "clip_url": clip_url,
                     "clip_path": str(clip_path),
-                    "cloudinary_clip_url": (clip_cloud or {}).get("playback_url"),
+                    "clip_key": uploaded_clip,
                 },
             }
             await repo.insert_delivery(doc)
@@ -161,14 +162,17 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
         )
         map_path = art / "pitch_map.png"
         write_pitch_map(map_path, analyzed, cal["pitch_length_m"], cal["pitch_width_m"])
-        ov_cloud = cloud.upload_video(overlay_path, f"{job_id}_overlay")
-        map_cloud = cloud.upload_image(map_path, f"{job_id}_pitchmap")
+        overlay_key = f"overlays/{job_id}_overlay.mp4"
+        map_key = f"files/{job_id}_pitchmap.png"
+        uploaded_overlay = cloud.upload_video(overlay_path, overlay_key)
+        uploaded_map = cloud.upload_image(map_path, map_key)
 
         artifacts = {
-            "overlay_url": (ov_cloud or {}).get("playback_url") or f"/balltrack/media/{job_id}/overlay.mp4",
-            "pitch_map_url": (map_cloud or {}).get("secure_url") or f"/balltrack/media/{job_id}/pitch_map.png",
-            "cloudinary_overlay_url": (ov_cloud or {}).get("playback_url"),
-            "cloudinary_pitch_map_url": (map_cloud or {}).get("secure_url"),
+            "job_id": job_id,
+            "overlay_url": f"/balltrack/media/{job_id}/overlay.mp4",
+            "pitch_map_url": f"/balltrack/media/{job_id}/pitch_map.png",
+            "overlay_key": uploaded_overlay,
+            "pitch_map_key": uploaded_map,
         }
 
         await progress.aset("agent", 0, "Matching drills to what we saw", force=True)

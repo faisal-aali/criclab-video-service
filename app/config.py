@@ -37,17 +37,13 @@ class Settings(BaseSettings):
     # Same cap as the website API. Only this process increments the Mongo counter.
     daily_video_quota: int = 60
 
-    cloudinary_url: str | None = None
-    cloudinary_cloud_name: str | None = None
-    cloudinary_api_key: str | None = None
-    cloudinary_api_secret: str | None = None
+    s3_bucket: str | None = None
+    s3_region: str | None = None
 
     @field_validator(
         "default_meters_per_pixel",
-        "cloudinary_url",
-        "cloudinary_cloud_name",
-        "cloudinary_api_key",
-        "cloudinary_api_secret",
+        "s3_bucket",
+        "s3_region",
         "aws_access_key_id",
         "aws_secret_access_key",
         "ec2_instance_id",
@@ -118,10 +114,8 @@ class Settings(BaseSettings):
         return path
 
     @property
-    def cloudinary_configured(self) -> bool:
-        if self.cloudinary_url:
-            return True
-        return bool(self.cloudinary_cloud_name and self.cloudinary_api_key and self.cloudinary_api_secret)
+    def s3_configured(self) -> bool:
+        return bool(self.s3_bucket and self.s3_region)
 
 
 @lru_cache

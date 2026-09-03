@@ -96,6 +96,10 @@ async def top_throws(limit: int = 20) -> list[dict[str, Any]]:
     return await get_db().deliveries.aggregate(pipeline).to_list(cap)
 
 
+async def update_video(video_id: str, **fields: Any) -> None:
+    await get_db().videos.update_one({"_id": video_id}, {"$set": fields})
+
+
 async def get_video(video_id: str) -> dict[str, Any] | None:
     return await get_db().videos.find_one({"_id": video_id})
 

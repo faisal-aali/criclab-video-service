@@ -21,7 +21,7 @@ memory-bank/
 | File | Role |
 |------|------|
 | `productBrief.md` | Cricket bowling lab: upload → analyze → metrics → PDF |
-| `techContext.md` | Python worker, MediaPipe, Mongo (shared), Cloudinary, Bedrock/Ollama |
+| `techContext.md` | Python worker, MediaPipe, Mongo (shared), S3, Bedrock/Ollama |
 | `systemPatterns.md` | CV measures; Gemma coaches; two film modes; catalog matching vs HTTP |
 | `roadmap.md` | Pipeline features that run in this process |
 

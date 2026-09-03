@@ -10,7 +10,7 @@ High-level features **this worker** runs. Website auth / Train HTTP / UI live in
 | FEAT-006 | Calibration | Done (basic) | Scale from pose body height or provided reference |
 | FEAT-007 | **Biomechanics metrics** | Done | Leave-hand arm speed, joints, timing, scores from ok metrics only |
 | FEAT-008 | **Slow-mo overlay video** | Done | SpinLab HUD on original colour frames |
-| FEAT-009 | **Cloudinary hosting** | Done | Overlay + PDF upload from this process |
+| FEAT-009 | **S3 hosting** | Done | GetObject original; overlay/PDF/compressed PutObject (no CloudFront) |
 | FEAT-011 | AI agent (Gemma) | Done | Coaching from metrics JSON; catalog-only drill IDs |
 | FEAT-012 | **SpinLab-style PDF** | Done | Event stills, charts, AI notes, drill URLs as text |
 | FEAT-014 | Ball tracking (Action) | Done | In-air flight lock; headline km/h when the path leaves the hand |
