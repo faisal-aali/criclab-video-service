@@ -20,6 +20,26 @@ class ObjectKeyTests(unittest.TestCase):
         )
 
 
+class ResolveContentTypeTests(unittest.TestCase):
+    def test_from_extension(self) -> None:
+        self.assertEqual(
+            s3_service.resolve_content_type("overlays/job_overlay.mp4"),
+            "video/mp4",
+        )
+        self.assertEqual(
+            s3_service.resolve_content_type("files/job_report.pdf"),
+            "application/pdf",
+        )
+        self.assertEqual(
+            s3_service.resolve_content_type("files/job_pitchmap.png"),
+            "image/png",
+        )
+        self.assertEqual(
+            s3_service.resolve_content_type("original/u/a.mov", "video/mp4"),
+            "video/mp4",
+        )
+
+
 class FfmpegArgvTests(unittest.TestCase):
     def test_playback_flags(self) -> None:
         with patch("app.services.s3_service._ffmpeg_exe", return_value="ffmpeg"):

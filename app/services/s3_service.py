@@ -7,6 +7,7 @@ API signs GET URLs at read time.
 from __future__ import annotations
 
 import inspect
+import mimetypes
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,20 @@ from typing import Any
 from app.config import get_settings
 
 PREFIXES = ("original/", "compressed/", "overlays/", "files/")
+_GENERIC_CONTENT_TYPES = frozenset(
+    {"", "application/octet-stream", "binary/octet-stream"}
+)
+_SUFFIX_CONTENT_TYPES = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo",
+    ".mkv": "video/x-matroska",
+    ".webm": "video/webm",
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
 MAX_BYTES = 180_000_000
 SCALE_FILTER = (
     "scale=1280:720:force_original_aspect_ratio=decrease,"
@@ -67,6 +82,18 @@ def is_our_object_key(key: str | None) -> bool:
     if not k or ".." in k or "\\" in k or "\n" in k:
         return False
     return any(k.startswith(p) for p in PREFIXES)
+
+
+def resolve_content_type(name_or_key: str, hint: str | None = None) -> str:
+    """Pick a MIME type from a filename/object key, with an optional caller hint."""
+    hinted = (hint or "").strip().lower()
+    if hinted and hinted not in _GENERIC_CONTENT_TYPES:
+        return hinted
+    guessed, _ = mimetypes.guess_type(name_or_key)
+    if guessed:
+        return guessed
+    suffix = Path(name_or_key).suffix.lower()
+    return _SUFFIX_CONTENT_TYPES.get(suffix, "application/octet-stream")
 
 
 def _ffmpeg_exe() -> str:
@@ -126,7 +153,8 @@ def upload_file(
 ) -> str | None:
     if not s3_configured() or not is_our_object_key(key) or not path.is_file():
         return None
-    extra: dict[str, str] = {"ContentType": content_type}
+    resolved = resolve_content_type(key or str(path), content_type)
+    extra: dict[str, str] = {"ContentType": resolved}
     if content_disposition:
         extra["ContentDisposition"] = content_disposition
     _s3_client().upload_file(str(path), get_settings().s3_bucket, key, ExtraArgs=extra)
