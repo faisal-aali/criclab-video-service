@@ -16,6 +16,7 @@ from app.balltrack.split import split_deliveries
 from app.balltrack.track import build_tracks
 from app.balltrack.validate import reject_reason
 from app.config import get_settings
+from app.pipeline.cancel import JobCancelled, raise_if_cancelled
 from app.pipeline.cv_vision import validate_ball_path_on_video
 from app.pipeline.job_progress import BALLTRACK_BANDS, JobReporter, clamp_counts
 
@@ -24,10 +25,12 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
     settings = get_settings()
     progress = JobReporter(job_id, bands=BALLTRACK_BANDS, update=repo.update_job)
     try:
+        await raise_if_cancelled(job_id, get_job=repo.get_job)
         await progress.aset("calibrate", 0, "Measuring the pitch", force=True)
         art = settings.storage_path / "balltrack" / job_id
         art.mkdir(parents=True, exist_ok=True)
 
+        await raise_if_cancelled(job_id, get_job=repo.get_job)
         await progress.aset("detect", 0, "Finding the ball", force=True)
 
         def on_detect(cur: int, tot: int) -> None:
@@ -54,6 +57,7 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
         )
         H = np.array(cal["H"], dtype=np.float64)
 
+        await raise_if_cancelled(job_id, get_job=repo.get_job)
         await progress.aset("track", 0, "Following each delivery", force=True)
         tracks = await asyncio.to_thread(build_tracks, frames, w, h, fps)
         deliveries_pts = split_deliveries(tracks, fps)
@@ -63,6 +67,7 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
             )
 
         n_paths = len(deliveries_pts)
+        await raise_if_cancelled(job_id, get_job=repo.get_job)
         await progress.aset(
             "metrics",
             0,
@@ -72,6 +77,7 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
         analyzed: list[dict[str, Any]] = []
         delivery_ids: list[str] = []
         for i_path, pts in enumerate(deliveries_pts):
+            await raise_if_cancelled(job_id, get_job=repo.get_job)
             await progress.aset(
                 "metrics",
                 (i_path + 1) / max(n_paths, 1),
@@ -136,6 +142,7 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
                     "clip_key": uploaded_clip,
                 },
             }
+            await raise_if_cancelled(job_id, get_job=repo.get_job)
             await repo.insert_delivery(doc)
             delivery_ids.append(did)
             analyzed.append({**metrics, "index": i + 1, "bounce": bounce})
@@ -145,6 +152,7 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
                 "No cricket ball detected. Nothing in this clip looked like a delivery (speed, bounce, and path toward the batter must all check out)."
             )
 
+        await raise_if_cancelled(job_id, get_job=repo.get_job)
         await progress.aset("render", 0, "Drawing the path onto your clip", force=True)
         overlay_path = art / "overlay.mp4"
         H_inv = np.array(cal["H_inv"], dtype=np.float64)
@@ -175,6 +183,7 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
             "pitch_map_key": uploaded_map,
         }
 
+        await raise_if_cancelled(job_id, get_job=repo.get_job)
         await progress.aset("agent", 0, "Matching drills to what we saw", force=True)
         from app.agent import ollama_agent
         from app.coaching.recommend import balltrack_tags
@@ -199,6 +208,7 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
             player_name="Bowler",
         )
 
+        await raise_if_cancelled(job_id, get_job=repo.get_job)
         await repo.update_session(
             session_id,
             status="completed",
@@ -217,6 +227,9 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
             message=f"Tracked {len(delivery_ids)} deliveries",
             session_id=session_id,
         )
+    except JobCancelled:
+        await repo.delete_deliveries_for_job(job_id)
+        raise
     except Exception as exc:
         await repo.update_job(
             job_id,

@@ -38,15 +38,16 @@ Same relative filenames (`agent/ollama_agent.py`, `balltrack/stumps.py`) are all
 - After download, ffmpeg writes `compressed/{id}.mp4` (1280×720, 30 fps, 1.5 Mbps H.264). Pose / ball-flight always run on the **original**, never the compressed file.
 - This process never mints CloudFront URLs and does not need the CloudFront private key. Persist object keys only.
 - Claims the oldest eligible job **across both collections** (`created_at` ASC). Action is not preferred over Ball-flight.
-- Before claim, take one slot on `quota_days` for the UTC day (`started < DAILY_VIDEO_QUOTA`). Fail and stale re-queue release today's slot; complete keeps it.
+- Before claim, take one slot on `quota_days` for the UTC day (`started < DAILY_VIDEO_QUOTA`). Fail and stale re-queue release today's slot; complete and **in-flight cancel** keep it. Queued cancel never took a slot.
 - Skip jobs whose `available_at` is still in the future. Missing `available_at` is treated as eligible (pre-quota rows).
 - Parallel clips = more processes (production PM2 `criclab-video-worker` is `instances: 1`).
 - Stale `claimed` jobs older than 1 hour are re-queued (and the day's slot is released). Do not Glacier those originals.
 - Stale `processing` / `analyzing` (1 hour) become `failed` and the original is archived.
-- After `_finish_slot` sees `completed` or `failed`, `original_archive.maybe_archive_for_job` CopyObjects `source_key` to Glacier Flexible Retrieval (`GLACIER`) unless another live job shares the key. Failures must not fail the job.
+- After `_finish_slot` sees `completed`, `failed`, or honored `cancelled`, `original_archive.maybe_archive_for_job` CopyObjects `source_key` to Glacier Flexible Retrieval (`GLACIER`) unless another live job shares the key. Failures must not fail the job.
 - `GetObject` `InvalidObjectState` → fail the job (do not RestoreObject).
-- Orphan sweep on the stale tick: all jobs for a `source_key` are terminal but the object is still Standard (in-flight cancel + dead worker).
-- `pipeline/runner.py` re-raises after writing `status=failed` so the worker logs `job failed`, not `finished`.
+- Orphan sweep on the stale tick: all jobs for a `source_key` are terminal but the object is still Standard (dead worker after cancel).
+- Cancel (the button, not a closed tab) is honored at the **next stage boundary**. The current pose/ball/render loop finishes. `JobCancelled` must not become `failed` or persist a delivery. `update_job` only writes while status is `claimed|processing|analyzing`, so progress cannot flip `cancelled` back to `processing`.
+- `pipeline/runner.py` re-raises after writing `status=failed` so the worker logs `job failed`, not `finished`. `JobCancelled` is re-raised without writing failed.
 - Production worker is a **separate** EC2 from the website API. Idle-stop when **nothing is claimable now** (empty queue, only tomorrow's `available_at`, or today's cap full). Do not stop while any job is `claimed` / `processing` / `analyzing`. The always-on API starts this instance at 00:00 UTC when leftover jobs become eligible.
 
 ## Two film modes (do not merge their numbers)

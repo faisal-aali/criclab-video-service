@@ -26,6 +26,7 @@ from app.pipeline import calibrate, extract, pose as pose_mod
 from app.pipeline import metrics as metrics_mod
 from app.pipeline import render as render_mod
 from app.pipeline import timebase, track
+from app.pipeline.cancel import JobCancelled, raise_if_cancelled
 from app.pipeline.job_progress import JobReporter, clamp_counts
 from app.pipeline.view import flight_is_trackable
 from app.services import s3_service
@@ -45,6 +46,7 @@ async def run_analysis_job(
     settings = get_settings()
     progress = JobReporter(job_id)
     try:
+        await raise_if_cancelled(job_id)
         await progress.aset("extract", 0, "Reading video metadata", force=True)
         meta = await asyncio.to_thread(extract.extract_video_meta, video_path)
         fps = float(meta["fps"] or 30.0)
@@ -53,6 +55,7 @@ async def run_analysis_job(
         artifact_dir.mkdir(parents=True, exist_ok=True)
 
         n_frames = int(meta.get("frame_count") or 0)
+        await raise_if_cancelled(job_id)
         await progress.aset(
             "pose",
             0,
@@ -76,6 +79,7 @@ async def run_analysis_job(
         if not pose_track.get("frames"):
             raise ValueError("No bowler pose detected — use a clearer, side-on video of the delivery.")
 
+        await raise_if_cancelled(job_id)
         await progress.aset("action", 0, "Finding the release and action phases", force=True)
         bowling_arm = (player_profile or {}).get("bowling_arm")
         action = await asyncio.to_thread(
@@ -90,6 +94,7 @@ async def run_analysis_job(
         frame_w = int(meta.get("width") or pose_track.get("width") or 1280)
         frame_h = int(meta.get("height") or pose_track.get("height") or 720)
 
+        await raise_if_cancelled(job_id)
         await progress.aset("ball", 0, "Following the ball after release", force=True)
 
         def on_ball(cur: int, tot: int) -> None:
@@ -157,6 +162,7 @@ async def run_analysis_job(
             action_mod.snap_release_to_ball_leave(pose_track, action, ball_track)
 
         # --- Metrics ---
+        await raise_if_cancelled(job_id)
         await progress.aset("metrics", 0, "Measuring the delivery", force=True)
         metrics = await asyncio.to_thread(
             metrics_mod.compute_metrics,
@@ -170,6 +176,7 @@ async def run_analysis_job(
         )
 
         # --- Slow-motion overlay video ---
+        await raise_if_cancelled(job_id)
         await progress.aset("render", 0, "Marking up the slow-motion clip", force=True)
         overlay_video_path = artifact_dir / "overlay.mp4"
         release_still_path = artifact_dir / "release.jpg"
@@ -200,6 +207,7 @@ async def run_analysis_job(
         )
 
         # --- Encode + upload processed video ---
+        await raise_if_cancelled(job_id)
         await progress.aset("upload", 0, "Saving your processed clip", force=True)
         overlay_key = f"overlays/{job_id}_overlay.mp4"
         pdf_key = f"files/{job_id}_report.pdf"
@@ -214,6 +222,7 @@ async def run_analysis_job(
             storage["video_error"] = str(e)
 
         # --- Agent narrative ---
+        await raise_if_cancelled(job_id)
         await progress.aset("agent", 0, "Writing your coaching notes", status="analyzing", force=True)
         previous = await repo.list_deliveries(limit=8, player_name=player_name)
         prev_metrics = [d.get("metrics") for d in previous if d.get("metrics")]
@@ -226,6 +235,7 @@ async def run_analysis_job(
         )
 
         # --- PDF ---
+        await raise_if_cancelled(job_id)
         await progress.aset("pdf", 0, "Building your report", status="analyzing", force=True)
         pdf_path = artifact_dir / "bowling_report.pdf"
         created = repo.utcnow()
@@ -282,6 +292,7 @@ async def run_analysis_job(
                 "pdf_key": storage.get("pdf_key"),
             },
         }
+        await raise_if_cancelled(job_id)
         await repo.insert_delivery(delivery)
 
         await repo.update_job(
@@ -297,6 +308,8 @@ async def run_analysis_job(
                 "pdf_key": storage.get("pdf_key"),
             },
         )
+    except JobCancelled:
+        raise
     except Exception as e:
         await repo.update_job(
             job_id, status="failed",

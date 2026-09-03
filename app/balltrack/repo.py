@@ -62,9 +62,18 @@ async def list_deliveries_for_session(session_id: str) -> list[dict[str, Any]]:
     return await cursor.to_list(length=200)
 
 
+async def delete_deliveries_for_job(job_id: str) -> int:
+    result = await _col_deliveries().delete_many({"job_id": job_id})
+    return int(result.deleted_count)
+
+
 async def insert_job(doc: dict[str, Any]) -> str:
     await _col_jobs().insert_one(doc)
     return doc["_id"]
+
+
+_IN_FLIGHT = ("claimed", "processing", "analyzing")
+_ACTIVE = ("queued", *_IN_FLIGHT)
 
 
 async def update_job(job_id: str, **fields: Any) -> None:
@@ -73,14 +82,14 @@ async def update_job(job_id: str, **fields: Any) -> None:
     update: dict[str, Any] = {"$set": fields}
     if fields.get("status") in (None, "processing", "analyzing"):
         update["$min"] = {"started_at": now}
-    await _col_jobs().update_one({"_id": job_id}, update)
+    await _col_jobs().update_one(
+        {"_id": job_id, "status": {"$in": list(_IN_FLIGHT)}},
+        update,
+    )
 
 
 async def get_job(job_id: str) -> dict[str, Any] | None:
     return await _col_jobs().find_one({"_id": job_id})
-
-
-_ACTIVE = ("queued", "claimed", "processing", "analyzing")
 
 
 async def peek_oldest_queued(now: datetime | None = None) -> dict[str, Any] | None:

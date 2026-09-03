@@ -31,7 +31,7 @@ For non-trivial work:
 
 ## Implementation rules
 
-- This repo: claim `queued` jobs (global FIFO + daily `quota_days` lease); MediaPipe/OpenCV; overlay; PDF; Gemma **video** notes; drill **matching**; Glacier archive of finished `original/` keys
+- This repo: claim `queued` jobs (global FIFO + daily `quota_days` lease); MediaPipe/OpenCV; overlay; PDF; Gemma **video** notes; drill **matching**; honor Cancel at the next stage; Glacier archive of finished `original/` keys
 - Catalog HTTP (Train / admin) stays in `criclab-web-backend` — do not add JWT, CORS, SMTP, or drill CRUD routes here
 - LLM: Ollama `gemma3:4b` locally or Bedrock in production; never measure frames
 - Persist deliveries in the **shared** MongoDB; the website API reads them

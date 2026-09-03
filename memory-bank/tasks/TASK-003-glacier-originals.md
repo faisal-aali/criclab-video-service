@@ -12,7 +12,7 @@ When this worker writes `completed` or `failed`, move that job's `source_key` to
 ## Acceptance criteria
 
 - [x] `archive_original` / `head_original` in this repo's `s3_service`
-- [x] `_finish_slot` archives on `completed` / `failed`
+- [x] `_finish_slot` archives on `completed` / `failed` / honored `cancelled`
 - [x] `_fail_stale_running_in` archives those failed jobs
 - [x] Stale `claimed` re-queue does not archive
 - [x] `InvalidObjectState` on download fails the job (no RestoreObject)
@@ -22,4 +22,4 @@ When this worker writes `completed` or `failed`, move that job's `source_key` to
 
 ## Notes
 
-Website API owns queued-cancel archive. This process does not mint CloudFront URLs. Glacier Flexible Retrieval has a 90-day minimum bill.
+Website API owns queued-cancel archive. This process archives after it honors an in-flight cancel (next stage). This process does not mint CloudFront URLs. Glacier Flexible Retrieval has a 90-day minimum bill.

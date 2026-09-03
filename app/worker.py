@@ -3,7 +3,8 @@
 The website API only inserts `status=queued` rows. These processes download
 clips from S3, run MediaPipe/OpenCV, and write progress back to the
 same job documents.
-Closing a browser tab cannot stop a claimed job.
+Closing a browser tab cannot stop a claimed job. The Cancel button is
+honored at the next stage boundary; the current CV loop is allowed to finish.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from app.balltrack.runner import run_balltrack_job
 from app.config import get_settings
 from app.db import quota, repository as repo
 from app.db.mongo import close_mongo, get_db, ping_mongo
+from app.pipeline.cancel import JobCancelled, raise_if_cancelled
 from app.pipeline.job_progress import JobReporter
 from app.pipeline.runner import run_analysis_job
 from app.services import original_archive, s3_service
@@ -106,6 +108,7 @@ async def _store_compressed(local: Path, record_id: str, *, balltrack: bool) -> 
 
 async def _run_action(job: dict) -> None:
     job_id = job["_id"]
+    await raise_if_cancelled(job_id)
     video = await repo.get_video(job["video_id"])
     if not video:
         raise ValueError("Video record missing")
@@ -116,7 +119,9 @@ async def _run_action(job: dict) -> None:
         balltrack=False,
         local_path=video.get("path"),
     )
+    await raise_if_cancelled(job_id)
     await _store_compressed(dest, video["_id"], balltrack=False)
+    await raise_if_cancelled(job_id)
     profile = video.get("player_profile") or {}
     await run_analysis_job(
         job_id=job_id,
@@ -132,6 +137,7 @@ async def _run_action(job: dict) -> None:
 
 async def _run_ballflight(job: dict) -> None:
     job_id = job["_id"]
+    await raise_if_cancelled(job_id, get_job=bt_repo.get_job)
     session = await bt_repo.get_session(job["session_id"])
     if not session:
         raise ValueError("Session record missing")
@@ -142,7 +148,9 @@ async def _run_ballflight(job: dict) -> None:
         balltrack=True,
         local_path=session.get("path"),
     )
+    await raise_if_cancelled(job_id, get_job=bt_repo.get_job)
     await _store_compressed(dest, session["_id"], balltrack=True)
+    await raise_if_cancelled(job_id, get_job=bt_repo.get_job)
     await run_balltrack_job(
         job_id=job_id,
         session_id=session["_id"],
@@ -260,7 +268,7 @@ async def _finish_slot(job: dict, kind: str) -> None:
     day = (latest or {}).get("quota_day") or job.get("quota_day")
     if status == "failed":
         await quota.release_lease(day)
-    if status in ("completed", "failed"):
+    if status in ("completed", "failed", "cancelled"):
         try:
             await original_archive.maybe_archive_for_job(latest or job)
         except Exception:
@@ -370,6 +378,8 @@ async def worker_loop() -> None:
             else:
                 await _run_ballflight(job)
             log.info("finished %s", job_id)
+        except JobCancelled:
+            log.info("job %s cancelled; not persisting", job_id)
         except Exception:
             log.exception("job %s failed", job_id)
             fail = dict(

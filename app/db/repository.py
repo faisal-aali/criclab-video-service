@@ -20,6 +20,10 @@ async def insert_video(doc: dict[str, Any]) -> str:
     return doc["_id"]
 
 
+_IN_FLIGHT = ("claimed", "processing", "analyzing")
+_ACTIVE = ("queued", *_IN_FLIGHT)
+
+
 async def insert_job(doc: dict[str, Any]) -> str:
     db = get_db()
     await db.jobs.insert_one(doc)
@@ -35,7 +39,11 @@ async def update_job(job_id: str, **fields: Any) -> None:
     # value ($min). ETA then measures analysis, not time spent in the queue.
     if fields.get("status") in (None, "processing", "analyzing"):
         update["$min"] = {"started_at": now}
-    await db.jobs.update_one({"_id": job_id}, update)
+    # Cancel/complete/fail are terminal. Progress must not flip them back.
+    await db.jobs.update_one(
+        {"_id": job_id, "status": {"$in": list(_IN_FLIGHT)}},
+        update,
+    )
 
 
 async def get_job(job_id: str) -> dict[str, Any] | None:
@@ -102,9 +110,6 @@ async def update_video(video_id: str, **fields: Any) -> None:
 
 async def get_video(video_id: str) -> dict[str, Any] | None:
     return await get_db().videos.find_one({"_id": video_id})
-
-
-_ACTIVE = ("queued", "claimed", "processing", "analyzing")
 
 
 async def peek_oldest_queued(now: datetime | None = None) -> dict[str, Any] | None:
