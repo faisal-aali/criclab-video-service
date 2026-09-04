@@ -22,7 +22,7 @@ from app.config import get_settings
 from app.db import repository as repo
 from app.pdf.report import build_pdf
 from app.pipeline import action as action_mod
-from app.pipeline import calibrate, extract, pose as pose_mod
+from app.pipeline import calibrate, clip_probe, extract, pose as pose_mod
 from app.pipeline import metrics as metrics_mod
 from app.pipeline import render as render_mod
 from app.pipeline import timebase, track
@@ -47,7 +47,8 @@ async def run_analysis_job(
     progress = JobReporter(job_id)
     try:
         await raise_if_cancelled(job_id)
-        await progress.aset("extract", 0, "Reading video metadata", force=True)
+        await progress.aset("extract", 0, "Checking the clip", force=True)
+        await asyncio.to_thread(clip_probe.assert_action_clip, video_path)
         meta = await asyncio.to_thread(extract.extract_video_meta, video_path)
         fps = float(meta["fps"] or 30.0)
 
