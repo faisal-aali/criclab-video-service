@@ -24,9 +24,11 @@ High-level features **this worker** runs. Website auth / Train HTTP / UI live in
 | FEAT-031 | **Daily video quota** | Done | Atomic `quota_days` lease; global FIFO claim; slot release on fail/stale |
 | FEAT-032 | **Glacier originals** | Done | Archive `original/` on completed/failed/honored-cancel; skip while a live job still needs GetObject |
 | FEAT-033 | **Honor in-flight cancel** | Done | Next-stage abort; do not overwrite `cancelled`; no delivery; quota slot stays used |
+| FEAT-034 | **Action clip gates** | Done | 100 MiB Action download; tagged 120/240, landscape 1080p, ≤10 s before pose |
 
 ## Change log
 
+- **4 Sep 2026 (FEAT-034):** Action download cap 100 MiB; `clip_probe` + `clip_spec` before pose (tagged 120/240, landscape 1080p, ≤10 s). Ball flight stays 180 MB.
 - Pipeline originally lived in `criclab-web-backend`. It now runs here so the website process stays free and closing a tab cannot stop a job.
 - **1 Sep 2026 (FEAT-026):** Drill matching (`weakness_tags`, `balltrack_tags`, hydrate) plus a read-only `drills.json` snapshot live in `app/coaching/`. Train / admin catalog HTTP stays on the website API. Failed Action jobs re-raise so the worker logs `job failed`, not `finished`.
 - **1 Sep 2026 (FEAT-027):** Same CI/deploy shape as the website API. `compileall` on GitHub; Deploy on the instance runner pulls `/var/www/criclab-video-service` and restarts one `criclab-video-worker`. No PM2 health API.

@@ -25,6 +25,7 @@ from app.balltrack.runner import run_balltrack_job
 from app.config import get_settings
 from app.db import quota, repository as repo
 from app.db.mongo import close_mongo, get_db, ping_mongo
+from app.pipeline import clip_spec
 from app.pipeline.cancel import JobCancelled, raise_if_cancelled
 from app.pipeline.job_progress import JobReporter
 from app.pipeline.runner import run_analysis_job
@@ -76,7 +77,20 @@ async def _fetch_source_video(
                 detail = {"current": written, "total": written, "unit": "bytes"}
             await progress.aset("ingest", frac, msg, detail=detail)
 
-        await s3_service.download_object(key, dest, on_progress=on_dl)
+        try:
+            await s3_service.download_object(
+                key,
+                dest,
+                max_bytes=clip_spec.MAX_BYTES if not balltrack else s3_service.MAX_BYTES,
+                on_progress=on_dl,
+            )
+        except ValueError as exc:
+            msg = str(exc).lower()
+            if not balltrack and "too large" in msg:
+                raise ValueError(clip_spec.MSG_SIZE) from exc
+            if not balltrack and "empty" in msg:
+                raise ValueError(clip_spec.MSG_EMPTY) from exc
+            raise
         return dest
     if local_path:
         path = Path(local_path)
