@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import traceback
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,8 @@ from app.pipeline.cancel import JobCancelled, raise_if_cancelled
 from app.pipeline.cv_vision import validate_ball_path_on_video
 from app.pipeline.job_progress import BALLTRACK_BANDS, JobReporter, clamp_counts
 
+log = logging.getLogger("criclab.balltrack")
+
 
 async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, calibration: dict[str, Any]) -> None:
     settings = get_settings()
@@ -29,6 +32,7 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
         await progress.aset("calibrate", 0, "Measuring the pitch", force=True)
         art = settings.storage_path / "balltrack" / job_id
         art.mkdir(parents=True, exist_ok=True)
+        log.debug("calibrate job_id=%s", job_id)
 
         await raise_if_cancelled(job_id, get_job=repo.get_job)
         await progress.aset("detect", 0, "Finding the ball", force=True)
@@ -45,6 +49,14 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
         frames, meta = await asyncio.to_thread(collect_candidates, video_path, on_progress=on_detect)
         fps = float(meta["fps"] or 30.0)
         w, h = int(meta["width"]), int(meta["height"])
+        log.debug(
+            "detect done job_id=%s frames=%s fps=%s %sx%s",
+            job_id,
+            len(frames) if frames is not None else 0,
+            fps,
+            w,
+            h,
+        )
         if w < 16 or h < 16:
             raise ValueError("Could not read video dimensions")
 
@@ -56,11 +68,18 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
             pitch_length_m=float(calibration.get("pitch_length_m") or 20.12),
         )
         H = np.array(cal["H"], dtype=np.float64)
+        log.debug(
+            "homography job_id=%s pitch_m=%s width_m=%s",
+            job_id,
+            cal.get("pitch_length_m"),
+            cal.get("pitch_width_m"),
+        )
 
         await raise_if_cancelled(job_id, get_job=repo.get_job)
         await progress.aset("track", 0, "Following each delivery", force=True)
         tracks = await asyncio.to_thread(build_tracks, frames, w, h, fps)
         deliveries_pts = split_deliveries(tracks, fps)
+        log.debug("track/split job_id=%s n_paths=%s", job_id, len(deliveries_pts))
         if not deliveries_pts:
             raise ValueError(
                 "No cricket ball detected. Film a real delivery down the pitch — empty or walking clips will not produce a speed."
@@ -93,9 +112,11 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
             )
             why = reject_reason(metrics, fps, h, cal["pitch_length_m"], cal["pitch_width_m"])
             if why:
+                log.debug("path reject job_id=%s i=%s reason=%s", job_id, i_path, why)
                 continue
             flow_ok, _flow_why, _flow = validate_ball_path_on_video(video_path, pts, w, h)
             if not flow_ok:
+                log.debug("path flow-reject job_id=%s i=%s reason=%s", job_id, i_path, _flow_why)
                 continue
             i = len(analyzed)
             did = repo.new_id("btd")
@@ -151,6 +172,7 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
             raise ValueError(
                 "No cricket ball detected. Nothing in this clip looked like a delivery (speed, bounce, and path toward the batter must all check out)."
             )
+        log.debug("metrics job_id=%s deliveries=%s", job_id, len(analyzed))
 
         await raise_if_cancelled(job_id, get_job=repo.get_job)
         await progress.aset("render", 0, "Drawing the path onto your clip", force=True)
@@ -174,6 +196,7 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
         map_key = f"files/{job_id}_pitchmap.png"
         uploaded_overlay = cloud.upload_video(overlay_path, overlay_key)
         uploaded_map = cloud.upload_image(map_path, map_key)
+        log.debug("render job_id=%s overlay_key=%s", job_id, uploaded_overlay)
 
         artifacts = {
             "job_id": job_id,
@@ -207,6 +230,7 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
             candidate_tags=tags,
             player_name="Bowler",
         )
+        log.debug("drills job_id=%s", job_id)
 
         await raise_if_cancelled(job_id, get_job=repo.get_job)
         await repo.update_session(
@@ -227,10 +251,13 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
             message=f"Tracked {len(delivery_ids)} deliveries",
             session_id=session_id,
         )
+        log.debug("ballflight complete job_id=%s deliveries=%s", job_id, len(delivery_ids))
     except JobCancelled:
+        log.debug("ballflight cancelled job_id=%s", job_id)
         await repo.delete_deliveries_for_job(job_id)
         raise
     except Exception as exc:
+        log.debug("ballflight fail job_id=%s err=%s", job_id, exc)
         await repo.update_job(
             job_id,
             status="failed",

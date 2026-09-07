@@ -13,6 +13,7 @@ from fastapi import FastAPI
 
 from app.config import get_settings
 from app.db.mongo import close_mongo, get_db, ping_mongo
+from app.logging_config import configure_logging
 
 log = logging.getLogger("criclab.video-service")
 
@@ -20,6 +21,7 @@ log = logging.getLogger("criclab.video-service")
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings = get_settings()
+    configure_logging(is_production=settings.is_production)
     for sub in ("videos", "artifacts", "frames", "balltrack"):
         (settings.storage_path / sub).mkdir(parents=True, exist_ok=True)
     if await ping_mongo():

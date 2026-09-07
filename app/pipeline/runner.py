@@ -11,6 +11,7 @@ Order (see memory-bank/systemPatterns.md):
 from __future__ import annotations
 
 import asyncio
+import logging
 import traceback
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,8 @@ from app.pipeline.job_progress import JobReporter, clamp_counts
 from app.pipeline.view import flight_is_trackable
 from app.services import s3_service
 
+log = logging.getLogger("criclab.pipeline")
+
 
 async def run_analysis_job(
     *,
@@ -48,14 +51,27 @@ async def run_analysis_job(
     try:
         await raise_if_cancelled(job_id)
         await progress.aset("extract", 0, "Checking the clip", force=True)
-        await asyncio.to_thread(clip_probe.assert_action_clip, video_path)
+        try:
+            await asyncio.to_thread(clip_probe.assert_action_clip, video_path)
+        except Exception as exc:
+            log.debug("clip_probe fail job_id=%s err=%s", job_id, exc)
+            raise
         meta = await asyncio.to_thread(extract.extract_video_meta, video_path)
         fps = float(meta["fps"] or 30.0)
+        n_frames = int(meta.get("frame_count") or 0)
+        log.debug(
+            "extract job_id=%s fps=%s frames=%s %sx%s duration_s=%s",
+            job_id,
+            fps,
+            n_frames,
+            meta.get("width"),
+            meta.get("height"),
+            meta.get("duration_s") or meta.get("duration"),
+        )
 
         artifact_dir = settings.storage_path / "artifacts" / job_id
         artifact_dir.mkdir(parents=True, exist_ok=True)
 
-        n_frames = int(meta.get("frame_count") or 0)
         await raise_if_cancelled(job_id)
         await progress.aset(
             "pose",
@@ -79,6 +95,7 @@ async def run_analysis_job(
         )
         if not pose_track.get("frames"):
             raise ValueError("No bowler pose detected — use a clearer, side-on video of the delivery.")
+        log.debug("pose done job_id=%s frames=%s", job_id, len(pose_track["frames"]))
 
         await raise_if_cancelled(job_id)
         await progress.aset("action", 0, "Finding the release and action phases", force=True)
@@ -86,11 +103,26 @@ async def run_analysis_job(
         action = await asyncio.to_thread(
             action_mod.analyze_action, pose_track, bowling_arm=bowling_arm
         )
+        log.debug(
+            "action/release job_id=%s side=%s release_frame=%s arm=%s",
+            job_id,
+            action.get("throwing_side"),
+            action.get("release_frame"),
+            bowling_arm,
+        )
 
         # --- Scale from upright (tall) body frames — never crouch-biased median ---
         body_heights = [h for h in (pose_mod.body_pixel_height(f) for f in pose_track["frames"]) if h]
         body_px = calibrate.upright_body_px_height(body_heights)
         scale = calibrate.resolve_scale(meters_per_pixel, reference_height_m, body_px)
+        log.debug(
+            "scale job_id=%s method=%s calibrated=%s mpp=%s body_px=%s",
+            job_id,
+            scale.get("method"),
+            scale.get("calibrated"),
+            scale.get("meters_per_pixel"),
+            body_px,
+        )
 
         frame_w = int(meta.get("width") or pose_track.get("width") or 1280)
         frame_h = int(meta.get("height") or pose_track.get("height") or 720)
@@ -120,6 +152,13 @@ async def run_analysis_job(
         # is cut in frames from fps, so a wrong fps mis-detects the events
         # themselves. The ball's own fall says what the capture rate really was.
         tb = timebase.measure_capture_fps(ball_track, scale.get("meters_per_pixel"), fps)
+        log.debug(
+            "timebase job_id=%s slow_motion=%s fps=%s container_fps=%s",
+            job_id,
+            tb.get("slow_motion"),
+            tb.get("fps"),
+            fps,
+        )
 
         # The ball path is indexed by frame, so it does not change with the
         # timebase and is never re-tracked here. What it does give us is the frame
@@ -156,11 +195,19 @@ async def run_analysis_job(
             ball_track, frame_w, frame_h, fps, scale.get("meters_per_pixel")
         )
         if ball_track and not real_ok:
+            log.debug("ball skip job_id=%s reason=%s", job_id, _real_reason)
             ball_track = []
             if leave is not None:  # release was pinned to a flight we just rejected
                 action = action_mod.analyze_action(pose_track, bowling_arm=bowling_arm)
         elif ball_track:
             action_mod.snap_release_to_ball_leave(pose_track, action, ball_track)
+        log.debug(
+            "ball job_id=%s locked=%s points=%s leave_frame=%s",
+            job_id,
+            bool(ball_track),
+            len(ball_track) if ball_track else 0,
+            leave,
+        )
 
         # --- Metrics ---
         await raise_if_cancelled(job_id)
@@ -174,6 +221,17 @@ async def run_analysis_job(
             ball_track=ball_track,
             player_profile=player_profile,
             timebase_info=tb,
+        )
+        quality = metrics.get("quality") or {}
+        ball_m = metrics.get("ball_speed_kmh")
+        arm_m = metrics.get("arm_speed_kmh")
+        log.debug(
+            "metrics job_id=%s speed_kmh=%s arm_kmh=%s view=%s calibrated=%s",
+            job_id,
+            ball_m.get("value") if isinstance(ball_m, dict) else ball_m,
+            arm_m.get("value") if isinstance(arm_m, dict) else arm_m,
+            quality.get("camera_view"),
+            (metrics.get("scale") or {}).get("calibrated"),
         )
 
         # --- Slow-motion overlay video ---
@@ -206,6 +264,7 @@ async def run_analysis_job(
             capture_fps=fps,
             on_progress=on_render,
         )
+        log.debug("overlay job_id=%s", job_id)
 
         # --- Encode + upload processed video ---
         await raise_if_cancelled(job_id)
@@ -219,8 +278,10 @@ async def run_analysis_job(
             )
             if uploaded:
                 storage["overlay_key"] = uploaded
+                log.debug("overlay uploaded key=%s", uploaded)
         except Exception as e:  # never fail the whole job on upload error
             storage["video_error"] = str(e)
+            log.debug("overlay upload fail job_id=%s err=%s", job_id, type(e).__name__)
 
         # --- Agent narrative ---
         await raise_if_cancelled(job_id)
@@ -233,6 +294,12 @@ async def run_analysis_job(
             comparison=comparison,
             player_name=player_name,
             player_profile=player_profile,
+        )
+        log.debug(
+            "coaching notes job_id=%s provider=%s prev=%s",
+            job_id,
+            settings.llm_provider,
+            len(prev_metrics),
         )
 
         # --- PDF ---
@@ -252,6 +319,7 @@ async def run_analysis_job(
             chart_dir=artifact_dir,
             stills_dir=stills_dir if stills_dir.exists() else None,
         )
+        log.debug("pdf job_id=%s", job_id)
         try:
             if pdf_path.is_file():
                 uploaded_pdf = await asyncio.to_thread(
@@ -263,8 +331,10 @@ async def run_analysis_job(
                 )
                 if uploaded_pdf:
                     storage["pdf_key"] = uploaded_pdf
+                    log.debug("pdf uploaded key=%s", uploaded_pdf)
         except Exception as e:
             storage["pdf_error"] = str(e)
+            log.debug("pdf upload fail job_id=%s err=%s", job_id, type(e).__name__)
 
         # --- Persist ---
         delivery_id = repo.new_id("del")
@@ -295,6 +365,7 @@ async def run_analysis_job(
         }
         await raise_if_cancelled(job_id)
         await repo.insert_delivery(delivery)
+        log.debug("delivery persisted job_id=%s delivery_id=%s", job_id, delivery_id)
 
         await repo.update_job(
             job_id, status="completed", progress=100, stage="done", message="Analysis complete",
@@ -310,8 +381,10 @@ async def run_analysis_job(
             },
         )
     except JobCancelled:
+        log.debug("pipeline cancelled job_id=%s", job_id)
         raise
     except Exception as e:
+        log.debug("pipeline fail job_id=%s err=%s", job_id, e)
         await repo.update_job(
             job_id, status="failed",
             message=str(e), error=traceback.format_exc(),

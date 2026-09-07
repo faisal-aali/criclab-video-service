@@ -24,6 +24,7 @@ from app.balltrack import repo as bt_repo
 from app.balltrack.runner import run_balltrack_job
 from app.config import get_settings
 from app.db import quota, repository as repo
+from app.logging_config import configure_logging
 from app.db.mongo import close_mongo, get_db, ping_mongo
 from app.pipeline import clip_spec
 from app.pipeline.cancel import JobCancelled, raise_if_cancelled
@@ -57,6 +58,7 @@ async def _fetch_source_video(
     key = (source_key or "").strip().lstrip("/")
     if key and s3_service.s3_configured():
         if not s3_service.is_our_object_key(key):
+            log.debug("fetch reject key not ours job_id=%s key=%s", job_id, key)
             raise ValueError("source_key is not an S3 object key")
         dest = _ingest_dest(record_id, key, balltrack=balltrack)
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -84,7 +86,9 @@ async def _fetch_source_video(
                 max_bytes=clip_spec.MAX_BYTES if not balltrack else s3_service.MAX_BYTES,
                 on_progress=on_dl,
             )
+            log.debug("download %s -> %s bytes=%s", key, dest, dest.stat().st_size if dest.is_file() else 0)
         except ValueError as exc:
+            log.debug("download failed job_id=%s key=%s err=%s", job_id, key, type(exc).__name__)
             msg = str(exc).lower()
             if not balltrack and "too large" in msg:
                 raise ValueError(clip_spec.MSG_SIZE) from exc
@@ -95,12 +99,15 @@ async def _fetch_source_video(
     if local_path:
         path = Path(local_path)
         if path.is_file():
+            log.debug("fetch local path job_id=%s bytes=%s", job_id, path.stat().st_size)
             return path
+    log.debug("fetch missing source job_id=%s key=%s local=%s", job_id, key or None, local_path)
     raise FileNotFoundError("Clip has no S3 source_key")
 
 
 async def _store_compressed(local: Path, record_id: str, *, balltrack: bool) -> str | None:
     if not s3_service.s3_configured():
+        log.debug("compressed skip s3_off record_id=%s", record_id)
         return None
     compressed_key = f"compressed/{record_id}.mp4"
     encoded = local.with_name(f"{local.stem}_compressed.mp4")
@@ -117,6 +124,7 @@ async def _store_compressed(local: Path, record_id: str, *, balltrack: bool) -> 
             await bt_repo.update_session(record_id, compressed_key=uploaded)
         else:
             await repo.update_video(record_id, compressed_key=uploaded)
+        log.debug("compressed uploaded record_id=%s key=%s", record_id, uploaded)
     return uploaded
 
 
@@ -125,7 +133,15 @@ async def _run_action(job: dict) -> None:
     await raise_if_cancelled(job_id)
     video = await repo.get_video(job["video_id"])
     if not video:
+        log.debug("action video missing job_id=%s video_id=%s", job_id, job.get("video_id"))
         raise ValueError("Video record missing")
+    log.debug(
+        "action start job_id=%s video_id=%s user_id=%s source_key=%s",
+        job_id,
+        video["_id"],
+        video.get("user_id"),
+        video.get("source_key"),
+    )
     dest = await _fetch_source_video(
         video.get("source_key"),
         video["_id"],
@@ -154,7 +170,15 @@ async def _run_ballflight(job: dict) -> None:
     await raise_if_cancelled(job_id, get_job=bt_repo.get_job)
     session = await bt_repo.get_session(job["session_id"])
     if not session:
+        log.debug("ballflight session missing job_id=%s session_id=%s", job_id, job.get("session_id"))
         raise ValueError("Session record missing")
+    log.debug(
+        "ballflight start job_id=%s session_id=%s user_id=%s source_key=%s",
+        job_id,
+        session["_id"],
+        session.get("user_id"),
+        session.get("source_key"),
+    )
     dest = await _fetch_source_video(
         session.get("source_key"),
         session["_id"],
@@ -270,6 +294,7 @@ async def _claim_next_fifo(worker_id: str) -> tuple[dict | None, str | None]:
     job = await claim(pick["_id"], worker_id, day)
     if job is None:
         await quota.release_lease(day)
+        log.debug("claim lost job_id=%s kind=%s", pick["_id"], kind)
         return None, None
     return job, kind
 
@@ -337,8 +362,9 @@ async def _stop_idle_instance(instance_id: str, region: str) -> bool:
 
 
 async def worker_loop() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     settings = get_settings()
+    configure_logging(is_production=settings.is_production)
+    log.debug("video worker %s boot db=%s", WORKER_ID, settings.mongodb_db)
     for sub in ("videos", "artifacts", "frames", "balltrack"):
         (settings.storage_path / sub).mkdir(parents=True, exist_ok=True)
     if not await ping_mongo():
@@ -385,14 +411,17 @@ async def worker_loop() -> None:
             continue
         idle_since = None
         job_id = job["_id"]
+        log.debug("claimed %s job_id=%s", kind, job_id)
         log.info("claimed %s job %s", kind, job_id)
         try:
             if kind == "action":
                 await _run_action(job)
             else:
                 await _run_ballflight(job)
+            log.debug("finished job_id=%s", job_id)
             log.info("finished %s", job_id)
         except JobCancelled:
+            log.debug("job cancelled job_id=%s kind=%s", job_id, kind)
             log.info("job %s cancelled; not persisting", job_id)
         except Exception:
             log.exception("job %s failed", job_id)

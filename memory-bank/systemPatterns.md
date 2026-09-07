@@ -130,6 +130,26 @@ Python helpers the runner calls (not Ollama tool-calling):
 
 `APP_ENV=local` → Ollama. `APP_ENV=production` → Bedrock.
 
+## Logging
+
+- **Stdlib `logging` only — same `app/logging_config.py` as the website API**
+  (the files are identical on purpose). `configure_logging(is_production=...)`
+  runs once in the lifespan of `app/main.py`; the worker process
+  (`python -m app.worker`) calls it too. Level: DEBUG local, WARNING production.
+  `boto3`/`botocore`/`urllib3`/`pymongo`/`s3transfer`/`matplotlib`/`PIL` are
+  pinned to WARNING — add new loud third-party loggers to `_NOISY` there.
+- **Module loggers live under the `criclab` namespace:**
+  `log = logging.getLogger("criclab.<module>")` — e.g. `criclab.video-service`,
+  `criclab.video-worker`, `criclab.pipeline`. Loggers outside `criclab.*` are filtered
+  out in production.
+- **Lazy `%s` args, not f-strings.** Log job id + stage at stage boundaries
+  (claim, each pipeline stage, finish/fail) — that is the only per-job trace on
+  the worker box, since there is no web request log here.
+- **Failures must still log before re-raise**: `pipeline/runner.py` writes
+  `status=failed` then re-raises so the worker logs `job failed`. New stages
+  should follow that — log the reason, then raise; do not swallow.
+- **Never log secrets** (S3 keys, Mongo URI) or full LLM prompts/responses.
+
 ## Anti-patterns (do not introduce)
 
 - Using the LLM as the motion engine or to invent km/h / YouTube IDs
