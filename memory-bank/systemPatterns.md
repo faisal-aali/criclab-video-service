@@ -114,6 +114,15 @@ Add a metric by extending the metrics stage + JSON. UI cards live in `criclab-we
 - Overlay render stays OpenCV (30 fps, max width 1280); ffmpeg then enforces 1280×720 + 1.5 Mbps for S3 `overlays/` (and Ball-flight clips). Same encode for `compressed/`.
 - Overlay/PDF S3 upload failures must not fail the job; fall back to local `/artifacts/...`.
 
+## Local disk cleanup
+
+- Once a job is terminal (`completed`, `failed`, or `cancelled`) `worker.py` calls `app/services/cleanup.py` to remove local source video, compressed playback, overlay, PDF, stills, charts, pitch maps and temp frames.
+- Cleanup is a no-op when S3 is not configured, preserving the local `/artifacts/...` fallback in dev.
+- For `completed` jobs the artifact directory is only deleted once S3 keys are confirmed (`overlay_key` + `pdf_key` for Action; `overlay_key` + `pitch_map_key` + all `clip_key`s for Ball-flight). `failed`/`cancelled` jobs delete junk unconditionally.
+- Source videos are deleted from disk regardless of whether the S3 original has moved to Glacier; S3 is the durable copy.
+- Cleanup errors are logged and swallowed; they never fail the job.
+- Stale `processing` / `analyzing` jobs that are marked `failed` by the stale sweep also call cleanup, so crashed workers do not leave orphan files.
+
 ## Coaching (matching, not catalog HTTP)
 
 - Tags are deterministic (`weakness_tags` for Action, `balltrack_tags` for Ball flight). Gemma does not choose tags.

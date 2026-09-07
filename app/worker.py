@@ -30,7 +30,7 @@ from app.pipeline import clip_spec
 from app.pipeline.cancel import JobCancelled, raise_if_cancelled
 from app.pipeline.job_progress import JobReporter
 from app.pipeline.runner import run_analysis_job
-from app.services import original_archive, s3_service
+from app.services import cleanup, original_archive, s3_service
 
 log = logging.getLogger("criclab.video-worker")
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
@@ -219,7 +219,7 @@ async def _requeue_stale_in(collection) -> None:
         await quota.mark_dirty()
 
 
-async def _fail_stale_running_in(collection) -> None:
+async def _fail_stale_running_in(collection, kind: str) -> None:
     cutoff = repo.utcnow() - timedelta(hours=1)
     now = repo.utcnow()
     filt = {
@@ -248,14 +248,46 @@ async def _fail_stale_running_in(collection) -> None:
             await original_archive.maybe_archive_for_job(job)
         except Exception:
             log.exception("glacier archive after stale fail %s", job.get("_id"))
+        try:
+            if kind == "action":
+                video_id = job.get("video_id")
+                if video_id:
+                    video = await repo.get_video(video_id)
+                    if video:
+                        await asyncio.to_thread(
+                            cleanup.cleanup_action_files,
+                            str(job["_id"]),
+                            video_id,
+                            video.get("source_key"),
+                            None,
+                            None,
+                            "failed",
+                        )
+            else:
+                session_id = job.get("session_id")
+                if session_id:
+                    session = await bt_repo.get_session(session_id)
+                    if session:
+                        await asyncio.to_thread(
+                            cleanup.cleanup_balltrack_files,
+                            str(job["_id"]),
+                            session_id,
+                            session.get("source_key"),
+                            None,
+                            None,
+                            "failed",
+                            None,
+                        )
+        except Exception:
+            log.exception("local cleanup after stale fail %s", job.get("_id"))
 
 
 async def _requeue_stale() -> None:
     db = get_db()
     await _requeue_stale_in(db.jobs)
     await _requeue_stale_in(db["balltrack_jobs"])
-    await _fail_stale_running_in(db.jobs)
-    await _fail_stale_running_in(db["balltrack_jobs"])
+    await _fail_stale_running_in(db.jobs, "action")
+    await _fail_stale_running_in(db["balltrack_jobs"], "balltrack")
     try:
         await original_archive.sweep_orphan_originals()
     except Exception:
@@ -312,6 +344,44 @@ async def _finish_slot(job: dict, kind: str) -> None:
             await original_archive.maybe_archive_for_job(latest or job)
         except Exception:
             log.exception("glacier archive after %s %s", status, job_id)
+
+        try:
+            if kind == "action":
+                video_id = (latest or job).get("video_id")
+                if video_id:
+                    video = await repo.get_video(video_id)
+                    result = (latest or job).get("result") or {}
+                    await asyncio.to_thread(
+                        cleanup.cleanup_action_files,
+                        job_id,
+                        video_id,
+                        (video or {}).get("source_key"),
+                        result.get("overlay_key"),
+                        result.get("pdf_key"),
+                        status,
+                    )
+            else:
+                session_id = (latest or job).get("session_id")
+                if session_id:
+                    session = await bt_repo.get_session(session_id)
+                    artifacts = (session or {}).get("artifacts") or {}
+                    deliveries = await bt_repo.list_deliveries_for_session(session_id)
+                    clip_keys = [
+                        (d.get("artifacts") or {}).get("clip_key")
+                        for d in deliveries
+                    ]
+                    await asyncio.to_thread(
+                        cleanup.cleanup_balltrack_files,
+                        job_id,
+                        session_id,
+                        (session or {}).get("source_key"),
+                        artifacts.get("overlay_key"),
+                        artifacts.get("pitch_map_key"),
+                        status,
+                        clip_keys,
+                    )
+        except Exception:
+            log.exception("local cleanup after %s %s", status, job_id)
     await quota.mark_dirty()
 
 
