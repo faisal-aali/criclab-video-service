@@ -62,10 +62,12 @@ Never paste stump speed onto a pose job.
 ## Action clip gates
 
 Action ingest only: download `max_bytes` 100 MiB (Ball flight stays 180 MB).
-Before pose, `clip_probe.assert_action_clip` checks tagged container **120 or
-240 fps** (±3), landscape 1080p, ≤10 s, `.mp4`/`.mov`. Fail the job with the
-same user sentences as the uploader. Do **not** use `timebase.py` to approve a
-30 fps export. Overlay/compressed encode remains 720p30.
+Before pose, `clip_probe.assert_action_clip` requires **120 or 240 fps** (±3),
+landscape 1080p, ≤10 s, `.mp4`/`.mov`. iPhone slow-mo often tags playback as
+30 fps; the probe prefers media-timeline 120/240 (`r_frame_rate`,
+`avg_frame_rate`, or `nb_frames` / stream duration). Fail the job with the
+same user sentences as the uploader. Do **not** use `timebase.py` gravity to
+approve a 30 fps export. Overlay/compressed encode remains 720p30.
 
 ## Architecture rule #2 — pose is the measurement engine; ball speed needs a real lock
 

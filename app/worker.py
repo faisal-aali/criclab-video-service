@@ -445,10 +445,14 @@ async def worker_loop() -> None:
     idle_stop_s = max(1, int(settings.ec2_idle_stop_seconds))
     instance_id = settings.ec2_instance_id if settings.is_production else None
     while True:
-        ticks += 1
-        if ticks % 40 == 1:
-            await _requeue_stale()
-        job, kind = await _claim_next_fifo(WORKER_ID)
+        try:
+            ticks += 1
+            if ticks % 40 == 1:
+                await _requeue_stale()
+            job, kind = await _claim_next_fifo(WORKER_ID)
+        except asyncio.CancelledError:
+            log.info("video worker %s stopped", WORKER_ID)
+            return
         if kind == "quota_full" or job is None:
             now = time.monotonic()
             if idle_since is None:
@@ -477,7 +481,11 @@ async def worker_loop() -> None:
                         "daily quota full; will idle-stop if still blocked (%.0fs until UTC midnight)",
                         quota.seconds_until_utc_midnight(),
                     )
-            await asyncio.sleep(wait)
+            try:
+                await asyncio.sleep(wait)
+            except asyncio.CancelledError:
+                log.info("video worker %s stopped", WORKER_ID)
+                return
             continue
         idle_since = None
         job_id = job["_id"]
@@ -511,6 +519,8 @@ async def worker_loop() -> None:
 def main() -> None:
     try:
         asyncio.run(worker_loop())
+    except KeyboardInterrupt:
+        pass
     finally:
         try:
             asyncio.run(close_mongo())

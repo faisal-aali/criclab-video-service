@@ -1,7 +1,11 @@
 """Read tagged container metadata for Action clip gates.
 
 Prefers ffprobe (sibling of imageio-ffmpeg's ffmpeg), then `ffmpeg -i`,
-then OpenCV. Does not use timebase / gravity recovery.
+then OpenCV. Does not use gravity recovery in timebase.py.
+
+iPhone slow-mo often tags presentation as 30 fps (edit list / playback) while
+the media timeline is 120 or 240. Prefer any tagged or derived rate that is
+120/240 over treating that as VFR or as a 30 fps export.
 """
 
 from __future__ import annotations
@@ -113,8 +117,9 @@ def _ffprobe_json(path: Path) -> dict[str, Any] | None:
                 "error",
                 "-select_streams",
                 "v:0",
+                "-count_packets",
                 "-show_entries",
-                "stream=width,height,duration,avg_frame_rate,r_frame_rate,nb_frames,codec_type:stream_tags=rotate:side_data=rotation:format=duration",
+                "stream=width,height,duration,duration_ts,time_base,avg_frame_rate,r_frame_rate,nb_frames,nb_read_packets,codec_type:stream_tags=rotate:side_data=rotation:format=duration",
                 "-of",
                 "json",
                 str(path),
@@ -142,31 +147,7 @@ def _ffprobe_json(path: Path) -> dict[str, Any] | None:
             "rotation_deg": None,
             "variable_frame_rate": False,
         }
-    stream = streams[0]
-    r_fps = _ratio_fps(stream.get("r_frame_rate"))
-    avg_fps = _ratio_fps(stream.get("avg_frame_rate"))
-    fps = r_fps or avg_fps
-    vfr = bool(
-        r_fps and avg_fps and abs(r_fps - avg_fps) > clip_spec.FPS_TOLERANCE
-    )
-    duration = _float_or_none(stream.get("duration"))
-    if duration is None:
-        duration = _float_or_none((data.get("format") or {}).get("duration"))
-    rotation = _float_or_none((stream.get("tags") or {}).get("rotate"))
-    if rotation is None:
-        for side in stream.get("side_data_list") or []:
-            rotation = _float_or_none(side.get("rotation"))
-            if rotation is not None:
-                break
-    return {
-        "has_video_track": True,
-        "fps": fps,
-        "width": int(stream.get("width") or 0),
-        "height": int(stream.get("height") or 0),
-        "duration_s": duration,
-        "rotation_deg": rotation,
-        "variable_frame_rate": vfr,
-    }
+    return _meta_from_ffprobe_stream(streams[0], data.get("format") or {})
 
 
 def _ffmpeg_banner(path: Path) -> dict[str, Any] | None:
@@ -234,6 +215,90 @@ def _opencv_meta(path: Path) -> dict[str, Any] | None:
         "duration_s": float(meta.get("duration_s") or 0) or None,
         "rotation_deg": None,
         "variable_frame_rate": False,
+    }
+
+
+def _nb_frames(stream: dict[str, Any]) -> float | None:
+    n = _float_or_none(stream.get("nb_frames"))
+    if n is None:
+        n = _float_or_none(stream.get("nb_read_frames"))
+    if n is None:
+        n = _float_or_none(stream.get("nb_read_packets"))
+    return n if n and n > 0 else None
+
+
+def _stream_duration_s(stream: dict[str, Any]) -> float | None:
+    duration = _float_or_none(stream.get("duration"))
+    if duration is None:
+        ticks = _float_or_none(stream.get("duration_ts"))
+        tick = _ratio_fps(stream.get("time_base"))
+        if ticks and tick:
+            duration = ticks * tick
+    return duration if duration and duration > 0 else None
+
+
+def _prefer_slowmo_fps(*rates: float | None) -> float | None:
+    """If any candidate is 120/240, use the closest target. Else first positive."""
+    ok: list[float] = []
+    rest: list[float] = []
+    for rate in rates:
+        if rate is None or rate <= 0:
+            continue
+        if clip_spec.tagged_fps_ok(rate):
+            ok.append(rate)
+        else:
+            rest.append(rate)
+    if ok:
+        return max(ok)
+    return rest[0] if rest else None
+
+
+def _meta_from_ffprobe_stream(
+    stream: dict[str, Any], format_info: dict[str, Any]
+) -> dict[str, Any]:
+    r_fps = _ratio_fps(stream.get("r_frame_rate"))
+    avg_fps = _ratio_fps(stream.get("avg_frame_rate"))
+    media_s = _stream_duration_s(stream)
+    format_s = _float_or_none(format_info.get("duration"))
+    duration = media_s or (format_s if format_s and format_s > 0 else None)
+    frames = _nb_frames(stream)
+    from_count = (frames / media_s) if frames and media_s else None
+    fps = _prefer_slowmo_fps(r_fps, avg_fps, from_count)
+    # Presentation 30 + capture 120 is slow-mo, not true VFR.
+    vfr = False
+    if fps is None or not clip_spec.tagged_fps_ok(fps):
+        vfr = bool(
+            r_fps
+            and avg_fps
+            and abs(r_fps - avg_fps) > clip_spec.FPS_TOLERANCE
+        )
+    if fps and frames and clip_spec.tagged_fps_ok(fps):
+        wall = frames / fps
+        if wall > 0 and (duration is None or duration > wall * 1.5):
+            duration = wall
+    rotation = _float_or_none((stream.get("tags") or {}).get("rotate"))
+    if rotation is None:
+        for side in stream.get("side_data_list") or []:
+            rotation = _float_or_none(side.get("rotation"))
+            if rotation is not None:
+                break
+    log.debug(
+        "ffprobe fps r=%s avg=%s count=%s chosen=%s vfr=%s duration_s=%s",
+        r_fps,
+        avg_fps,
+        from_count,
+        fps,
+        vfr,
+        duration,
+    )
+    return {
+        "has_video_track": True,
+        "fps": fps,
+        "width": int(stream.get("width") or 0),
+        "height": int(stream.get("height") or 0),
+        "duration_s": duration,
+        "rotation_deg": rotation,
+        "variable_frame_rate": vfr,
     }
 
 
