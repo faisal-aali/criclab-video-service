@@ -13,9 +13,58 @@ from app.config import get_settings
 
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
+# Matches a JSON array of objects, e.g. `[{"drill_id": "...", ...}, ...]`. Used both to
+# find a recommendations blob that landed in the wrong section, and to strip one out of
+# prose text it should never have appeared in — a small local model is not reliable about
+# keeping its JSON under the right label.
+_JSON_ARRAY_RE = re.compile(r"\[\s*\{.*?\}\s*\]", re.DOTALL)
+# Matches things like (drill_id: "front_foot_block"), "drill_id": "front_foot_block",
+# or drill_id: front_foot_block that the small model sometimes leaks into prose.
+_DRILL_ID_RE = re.compile(
+    r"[\(\[]?\s*['\"]?drill_id['\"]?\s*[:=]\s*['\"]?[a-z0-9_]+['\"]?\s*[\)\]]?",
+    re.IGNORECASE,
+)
+
 
 def _clean(text: str) -> str:
     return _CONTROL_RE.sub("", text or "").strip()
+
+
+def _strip_drill_ids(text: str) -> str:
+    """Remove any 'drill_id: ...' snippets the model leaks into prose."""
+    if not text:
+        return text
+    text = _DRILL_ID_RE.sub("", text)
+    text = re.sub(r"\(\s*\)", "", text)
+    text = re.sub(r"\[\s*\]", "", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip()
+
+
+def _strip_embedded_json(text: str) -> str:
+    """Remove any JSON-array-shaped substring and drill_id leaks from prose so it never renders as raw text."""
+    if not text:
+        return text
+    return _clean(re.sub(r"\n{3,}", "\n\n", _strip_drill_ids(_JSON_ARRAY_RE.sub("", text))))
+
+
+def _extract_recommendations_anywhere(sections: dict[str, str], raw_text: str) -> list[dict[str, Any]]:
+    """Recover a recommendations JSON array even if the model mislabeled or merged
+    sections, by falling back to a scan of the whole raw response.
+    """
+    picks = _parse_recommendation_list(sections.get("RECOMMENDATIONS", ""))
+    if picks:
+        return picks
+    for value in sections.values():
+        match = _JSON_ARRAY_RE.search(value or "")
+        if match:
+            picks = _parse_recommendation_list(match.group(0))
+            if picks:
+                return picks
+    match = _JSON_ARRAY_RE.search(raw_text or "")
+    if match:
+        return _parse_recommendation_list(match.group(0))
+    return []
 
 
 def _model_installed(configured: str, installed: list[str]) -> bool:
@@ -264,7 +313,12 @@ async def generate_report(
 
     profile = player_profile or metrics.get("player_profile") or {}
     tags = list(candidate_tags) if candidate_tags is not None else weakness_tags(metrics)
-    drills = allowed_drills if allowed_drills is not None else allowed_drill_summaries(tags)
+    bowling_style = profile.get("bowling_style")
+    drills = (
+        allowed_drills
+        if allowed_drills is not None
+        else allowed_drill_summaries(tags, bowling_style=bowling_style)
+    )
     tool_payload = {
         "player": {
             "name": profile.get("player_name") or player_name,
@@ -272,7 +326,7 @@ async def generate_report(
             "height_m": profile.get("height_m"),
             "weight_lbs": profile.get("weight_lbs"),
             "bowling_arm": profile.get("bowling_arm"),
-            "bowling_style": profile.get("bowling_style"),
+            "bowling_style": bowling_style,
         },
         "metrics": get_delivery_metrics(metrics),
         "comparison": comparison or {},
@@ -284,7 +338,9 @@ async def generate_report(
         "Measurements come from pose estimation or stump-calibrated ball flight. "
         "Use ONLY the provided JSON; never invent or fill in null values. "
         "You do not measure speed or angles — never invent km/h, metres, or degrees. "
-        "Coach to this bowler's age, height, bowling arm, and style (pace/spin/medium). "
+        "Coach to this bowler's age, height, bowling arm, and style (pace/spin/medium); "
+        "only recommend drills from allowed_drills that suit their bowling_style — never recommend "
+        "a spin-technique drill to a pace bowler or a pace drill to a spin bowler. "
         "Never claim radar-grade ball speed unless ball_speed_kmh status is ok — that value is still an estimate. "
         "If ball speed is unavailable or speed_view_ok is false, say so and do not substitute arm/hand speed as ball speed. "
         "If speed_consistency.ok is false, treat the ball figure as a lower bound (the delivery recedes from the camera). "
@@ -292,10 +348,13 @@ async def generate_report(
         "If action_legality.verdict is null, do not call the action legal or illegal — the 15° test was not run. "
         "Never claim true 3D hip/trunk rotation from one camera. "
         "Give cricket-specific coaching from the available angles and timing. "
+        "When referring to a drill in prose, use its plain-English title or purpose; NEVER include a drill_id, JSON, or machine identifier in any prose section. "
         "Keep each prose section to 1-3 short sentences. "
         "After CONFIDENCE_NOTE, add RECOMMENDATIONS: a JSON array of objects "
         '{"drill_id","reason","priority"} using ONLY drill_id values from allowed_drills. '
         "Pick 2-3 drills that match candidate_tags. Do not invent ids or URLs. "
+        "Put the RECOMMENDATIONS JSON array immediately after the literal 'RECOMMENDATIONS:' label and "
+        "nowhere else — never place any JSON or drill_id values inside SUMMARY, OBSERVATIONS, STRENGTHS, IMPROVEMENTS, or CONFIDENCE_NOTE. "
         "Respond in plain text with these labeled sections exactly:\n"
         "SUMMARY:\nOBSERVATIONS:\nSTRENGTHS:\nIMPROVEMENTS:\nCONFIDENCE_NOTE:\nRECOMMENDATIONS:"
     )
@@ -308,20 +367,25 @@ async def generate_report(
     try:
         text = _clean(await generate_text(prompt, system=system, num_predict=750))
     except Exception as e:
-        text = _fallback_report(metrics, comparison, error=str(e), tags=tags)
+        # Some exceptions (notably httpx.ReadTimeout) carry no message, so str(e)
+        # can be "" — fall back to the exception's type name so this is never blank.
+        error_text = str(e) or f"{type(e).__name__} (no further detail from the exception)"
+        text = _fallback_report(metrics, comparison, error=error_text, tags=tags, bowling_style=bowling_style)
 
     sections = _parse_sections(text)
-    recs = hydrate_recommendations(_parse_recommendation_list(sections.get("RECOMMENDATIONS", "")), tags=tags)
+    raw_recs = _extract_recommendations_anywhere(sections, text)
+    recs = hydrate_recommendations(raw_recs, tags=tags, bowling_style=bowling_style)
     return {
         "raw": text,
-        "summary": _clean(sections.get("SUMMARY", text[:500])),
-        "observations": _clean(sections.get("OBSERVATIONS", "")),
-        "strengths": _clean(sections.get("STRENGTHS", "")),
-        "improvements": _clean(sections.get("IMPROVEMENTS", "")),
-        "confidence_note": _clean(
+        "summary": _strip_embedded_json(sections.get("SUMMARY", text[:500])),
+        "observations": _strip_embedded_json(sections.get("OBSERVATIONS", "")),
+        "strengths": _strip_embedded_json(sections.get("STRENGTHS", "")),
+        "improvements": _strip_embedded_json(sections.get("IMPROVEMENTS", "")),
+        "confidence_note": _strip_embedded_json(
             sections.get("CONFIDENCE_NOTE", "Metrics are video-derived estimates.")
         ),
         "recommendations": recs,
+        "weakness_tags": tags,
         "comparison": comparison or {},
     }
 
@@ -375,6 +439,7 @@ def _fallback_report(
     comparison: dict[str, Any] | None,
     error: str,
     tags: list[str] | None = None,
+    bowling_style: str | None = None,
 ) -> str:
     from app.coaching.recommend import fallback_picks
 
@@ -400,7 +465,7 @@ def _fallback_report(
     hist = ""
     if comparison and comparison.get("delta_kmh") is not None:
         hist = f"Ball-speed delta vs this bowler's recent average: {comparison['delta_kmh']:+.1f} km/h."
-    recs = fallback_picks(tags or [])
+    recs = fallback_picks(tags or [], bowling_style=bowling_style)
     rec_json = json.dumps(
         [{"drill_id": r["drill_id"], "reason": r["reason"], "priority": r["priority"]} for r in recs]
     )
