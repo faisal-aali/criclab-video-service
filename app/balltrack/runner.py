@@ -267,3 +267,8 @@ async def run_balltrack_job(*, job_id: str, session_id: str, video_path: Path, c
             error=traceback.format_exc()[-1500:],
         )
         await repo.update_session(session_id, status="failed", error=str(exc))
+        # Re-raise so the worker logs `job failed`, not `finished`, for a clip
+        # that did not finish — the same contract as the Action runner. The
+        # worker's own failure write is a no-op here because the status is no
+        # longer in-flight.
+        raise

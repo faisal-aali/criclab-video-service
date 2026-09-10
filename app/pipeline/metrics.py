@@ -8,11 +8,12 @@ Formulas (image plane; reject rather than clamp):
                  speed = hypot(vx, dy/dt) at first in-air sample × mpp × fps × 3.6
   arm_speed    = 90th-pct bowling-wrist px/frame from MER→REL on the pose track
                  (downswing on the video, not bowling_style, not a stalled REL frame)
-  release_time = (release_frame − FFC) / fps × 1000 ms
-  release_ht   = (planted_lead_ankle_y − wrist_y) × meters_per_pixel
-  elbow        = interior shoulder–elbow–wrist on the most in-plane frame near release
-  arm_swing    = unwrapped bowling-arm segment ω near release (deg/s)
-  stride       = |lead_ankle − trail_ankle| / body_height_px at FFC
+  release_time = (release_subframe − FFC_subframe) / fps × 1000 ms (integer frames as fallback)
+  release_ht   = (planted_lead_ankle_y − wrist_y at the fractional release) × meters_per_pixel
+  elbow        = interior shoulder–elbow–wrist on the most in-plane frame near release,
+                 interpolated to the fractional release when one is measured
+  arm_swing    = Theil–Sen slope of the unwrapped bowling-arm segment angle over ~40 ms (deg/s)
+  stride       = median |lead_ankle − trail_ankle| over ±40 ms around FFC / body_height_px
   hip–shoulder = 2D shoulder-line vs hip-line proxy (always estimated)
 """
 
@@ -28,7 +29,7 @@ import numpy as np
 log = logging.getLogger("criclab.metrics")
 
 from app.pipeline import pose as posemod
-from app.pipeline.action import frame_by_index
+from app.pipeline.action import DERIV_WINDOW_S, frame_by_index, theil_sen_slope
 from app.pipeline import track as ball_track_mod
 from app.pipeline.view import classify_camera_view, flight_geometry_ok
 
@@ -217,16 +218,42 @@ def _frames_near(frames: list[dict[str, Any]], center: int | None, fps: float, w
     return [f for f in frames if abs(int(f["frame"]) - center) <= span]
 
 
-def _best_elbow_near_release(frames, side: str, release_frame: int | None, fps: float) -> tuple[float | None, dict[str, Any] | None]:
+def _arm_points(frame: dict[str, Any] | None, side: str):
+    if frame is None:
+        return None
+    sh = posemod.point(frame, f"{side}_shoulder")
+    el = posemod.point(frame, f"{side}_elbow")
+    wr = posemod.point(frame, f"{side}_wrist")
+    if sh is None or el is None or wr is None:
+        return None
+    return sh, el, wr
+
+
+def _best_elbow_near_release(
+    frames,
+    side: str,
+    release_frame: int | None,
+    fps: float,
+    release_subframe: float | None = None,
+) -> tuple[float | None, dict[str, Any] | None, dict[str, Any]]:
     """Elbow interior angle on the most in-plane, most-extended pose near release.
 
     2D collapse (arm pointing at the camera) can report ~10° on a nearly straight arm.
     Prefer the frame with the longest shoulder–elbow–wrist projection, then the largest
     interior angle (180° = straight).
+
+    When a fractional release instant was measured from the ball, the final
+    value is the angle of the pose interpolated between the two frames that
+    bracket it — provided both project the arm at (nearly) the in-plane length
+    the search found, so the interpolation is not between a straight arm and a
+    foreshortened one. The window choice is unchanged; only the value is
+    refined. The angle difference between the two bracketing frames is
+    returned as the evidence for how much a sub-frame could matter.
     """
+    fit: dict[str, Any] = {"basis": "frame", "delta_deg": None}
     nearby = _frames_near(frames, release_frame, fps, 0.08)
     if not nearby:
-        return None, None
+        return None, None, fit
     ranked = sorted(nearby, key=lambda f: _arm_inplane_length(f, side), reverse=True)
     best_ang = None
     best_frame = None
@@ -242,8 +269,31 @@ def _best_elbow_near_release(frames, side: str, release_frame: int | None, fps: 
             best_ang = ang
             best_frame = f
     if best_ang is None:
-        return None, None
-    return round(float(best_ang), 1), best_frame
+        return None, None, fit
+    if release_subframe is not None and best_frame is not None:
+        by_frame = {int(f["frame"]): f for f in nearby}
+        f_lo = int(math.floor(float(release_subframe)))
+        frac = float(release_subframe) - f_lo
+        a = _arm_points(by_frame.get(f_lo), side)
+        b = _arm_points(by_frame.get(f_lo + 1), side)
+        ref_len = _arm_inplane_length(best_frame, side)
+        if a is not None and b is not None and ref_len > 0:
+            len_a = float(np.linalg.norm(a[0] - a[1]) + np.linalg.norm(a[1] - a[2]))
+            len_b = float(np.linalg.norm(b[0] - b[1]) + np.linalg.norm(b[1] - b[2]))
+            if min(len_a, len_b) >= 0.8 * ref_len:
+                ang_a = posemod.angle_3pt(*a)
+                ang_b = posemod.angle_3pt(*b)
+                mixed = tuple(pa * (1.0 - frac) + pb * frac for pa, pb in zip(a, b))
+                ang_m = posemod.angle_3pt(*mixed)
+                if ang_a is not None and ang_b is not None and ang_m is not None:
+                    fit = {
+                        "basis": "sub_frame",
+                        "delta_deg": round(abs(float(ang_a) - float(ang_b)), 1),
+                        "frames": [f_lo, f_lo + 1],
+                        "fraction": round(frac, 3),
+                    }
+                    return round(float(ang_m), 1), best_frame, fit
+    return round(float(best_ang), 1), best_frame, fit
 
 
 # ICC Article 6 / Law 21: an action is illegal when the elbow *straightens* by
@@ -628,24 +678,66 @@ def _line_angle_series(frames, a_name, b_name, *, fps: float = 30.0):
     return idxs, angs
 
 
-def _angular_velocity(idxs, angs, fps, smooth_win: int = 0):
+def _angular_velocity(idxs, angs, fps, window_s: float = DERIV_WINDOW_S):
+    """Angular velocity (deg/s) at each sample from a robust local slope.
+
+    The unwrapped angle series is fitted with a Theil–Sen line over a ~40 ms
+    window centred on each sample; the slope is the velocity. This replaces a
+    moving average followed by first differences, which at 120-240 fps turned
+    landmark jitter into thousands of deg/s of spiky "peaks" that the
+    plausibility band then had to throw away. The median slope ignores a single
+    bad sample outright, so no pre-smoothing is applied.
+
+    A window never bridges a dropped run (degenerate-segment filter, missed
+    pose): the unwrap branch across such a gap is arbitrary, and a velocity read
+    across it would be fiction.
+
+    Returns (frames, deg/s, median residual of the window around its line in
+    degrees) — the residual is the evidence for each velocity.
+    """
     if len(angs) < 2:
-        return [], []
+        return [], [], []
     unwrapped = np.degrees(np.unwrap(np.radians(angs)))
-    if smooth_win:
-        unwrapped = np.array(_moving_avg(list(unwrapped), smooth_win))
-    # A sample that bridges a dropped run (degenerate-segment filter, missed
-    # pose) would be fiction — the unwrap branch across the gap is arbitrary.
     dfs = [max(1, int(idxs[i]) - int(idxs[i - 1])) for i in range(1, len(idxs))]
     max_df = max(3.0, 3.0 * float(np.median(dfs))) if dfs else 3.0
-    vel, vidx = [], []
-    for i in range(1, len(unwrapped)):
-        df = max(1, idxs[i] - idxs[i - 1])
-        if df > max_df:
+    half = max(2, int(round(float(fps) * window_s / 2.0)))
+    n = len(idxs)
+    t_all = np.asarray(idxs, dtype=float)
+    vidx, vel, res = [], [], []
+    for i in range(n):
+        lo = i
+        while lo > 0 and idxs[i] - idxs[lo - 1] <= half and idxs[lo] - idxs[lo - 1] <= max_df:
+            lo -= 1
+        hi = i
+        while hi < n - 1 and idxs[hi + 1] - idxs[i] <= half and idxs[hi + 1] - idxs[hi] <= max_df:
+            hi += 1
+        if hi - lo + 1 < 3:
             continue
-        vel.append((unwrapped[i] - unwrapped[i - 1]) / df * fps)
-        vidx.append(idxs[i])
-    return vidx, vel
+        t = t_all[lo: hi + 1]
+        a = unwrapped[lo: hi + 1]
+        slope = theil_sen_slope(t, a)
+        icpt = float(np.median(a - slope * t))
+        r = float(np.median(np.abs(a - (icpt + slope * t))))
+        vidx.append(int(idxs[i]))
+        vel.append(float(slope * fps))
+        res.append(r)
+    return vidx, vel, res
+
+
+def _residual_near(vidx, res, center: int | None, span: int) -> float | None:
+    """Median local-fit residual within `span` frames of a frame (None if none)."""
+    if center is None or not res:
+        return None
+    near = [float(r) for i, r in zip(vidx, res) if abs(int(i) - int(center)) <= span]
+    return float(np.median(near)) if near else None
+
+
+def _residual_factor(resid: float | None, scale_deg: float, floor: float = 0.4) -> float:
+    """Confidence multiplier from a fit residual: 1 at zero, `floor` when the
+    residual reaches `scale_deg`. Derived from the fit, not hand-tuned per clip."""
+    if resid is None:
+        return 1.0
+    return float(np.clip(1.0 - float(resid) / float(scale_deg), floor, 1.0))
 
 
 def _peak_near_release(vidx, vel, release_frame: int | None, fps: float) -> tuple[float | None, float | None]:
@@ -809,6 +901,13 @@ def compute_metrics(
             arm_speed_mps, arm_speed_kmh = v_mps, v_kmh
             speed_status = "ok"
             speed_conf = min(0.85, 0.35 + scale_conf * 0.4 + act_conf * 0.3)
+            # The wrist velocity is a local straight-line fit; how far the
+            # landmarks sat from that line, relative to how far the wrist moves
+            # per frame, is the direct evidence for this number.
+            wrist_fit = action.get("wrist_speed_fit") or {}
+            w_res = wrist_fit.get("median_residual_px")
+            if w_res is not None and hand_speed_px:
+                speed_conf *= _residual_factor(float(w_res) / float(hand_speed_px), 0.5, floor=0.5)
             speed_note = (
                 "Bowling-wrist speed on the video through the throw "
                 "(pose track × your height — not bowling style, not a radar gun)"
@@ -960,19 +1059,69 @@ def compute_metrics(
             if ankles:
                 ground_y = max(float(p[1]) for p in ankles)
 
-    height_frame = rel_pose
-    if rel_pose is not None and side:
-        wr = posemod.point(rel_pose, f"{side}_wrist")
-        if wr is not None:
-            # REL is the bowling wrist at leave-hand — never the in-air ball.
-            release_point = {"x": float(wr[0]), "y": float(wr[1])}
+    subframes = action.get("phase_subframes") or {}
+    rel_sub = subframes.get("release")
+    by_frame = {int(f["frame"]): f for f in frames}
 
-    if height_frame is not None and side:
-        wr = posemod.point(height_frame, f"{side}_wrist")
-        sh = posemod.point(height_frame, f"{side}_shoulder")
-        el = posemod.point(height_frame, f"{side}_elbow")
-        if wr is not None and release_point is None:
-            release_point = {"x": float(wr[0]), "y": float(wr[1])}
+    # MediaPipe parks the bowling wrist on the forearm or chest exactly at
+    # leave-hand on many high-frame-rate clips. A wrist whose elbow→wrist reach
+    # has collapsed to half its usual length is not the hand, and a release
+    # height measured from it is a wrong number, not an imprecise one.
+    reaches: list[float] = []
+    if side and release_frame is not None:
+        for f in _frames_near(frames, release_frame, fps, 0.10):
+            w = posemod.point(f, f"{side}_wrist")
+            e = posemod.point(f, f"{side}_elbow")
+            if w is not None and e is not None:
+                reaches.append(float(np.linalg.norm(w - e)))
+    reach_med = float(np.median(reaches)) if len(reaches) >= 4 else None
+
+    def _wrist_valid(frame: dict[str, Any] | None):
+        if frame is None or not side:
+            return None
+        w = posemod.point(frame, f"{side}_wrist")
+        if w is None:
+            return None
+        e = posemod.point(frame, f"{side}_elbow")
+        if reach_med and e is not None and float(np.linalg.norm(w - e)) < 0.55 * reach_med:
+            return None
+        return w
+
+    wr_rel = None
+    height_basis = None
+    height_factor = 1.0
+    if rel_sub is not None:
+        f_lo = int(math.floor(float(rel_sub)))
+        frac = float(rel_sub) - f_lo
+        wa = _wrist_valid(by_frame.get(f_lo))
+        wb = _wrist_valid(by_frame.get(f_lo + 1))
+        if wa is not None and wb is not None:
+            wr_rel = wa * (1.0 - frac) + wb * frac
+            height_basis = "sub_frame"
+        elif wa is not None and frac < 0.5:
+            wr_rel, height_basis = wa, "nearest_frame"
+        elif wb is not None and frac >= 0.5:
+            wr_rel, height_basis = wb, "nearest_frame"
+    if wr_rel is None and rel_pose is not None:
+        wr_rel = _wrist_valid(rel_pose)
+        if wr_rel is not None:
+            height_basis = "release_frame"
+        elif release_frame is not None:
+            for d in (1, -1, 2, -2):
+                w = _wrist_valid(by_frame.get(int(release_frame) + d))
+                if w is not None:
+                    wr_rel, height_basis, height_factor = w, f"release_frame{d:+d}", 0.8
+                    break
+    wrist_collapsed = wr_rel is None and rel_pose is not None and side and posemod.point(rel_pose, f"{side}_wrist") is not None
+
+    if wr_rel is not None:
+        # REL is the bowling wrist at leave-hand — never the in-air ball.
+        release_point = {"x": float(wr_rel[0]), "y": float(wr_rel[1])}
+
+    if rel_pose is not None and side:
+        wr = wr_rel
+        sh = posemod.point(rel_pose, f"{side}_shoulder")
+        el = posemod.point(rel_pose, f"{side}_elbow")
         # Release height is a *vertical* distance, and turning the camera around the
         # bowler does not foreshorten vertical pixels the way it foreshortens a
         # stride down the pitch. The height scale comes from this same bowler's own
@@ -984,13 +1133,14 @@ def compute_metrics(
                 release_height_status = "ok"
                 release_height_note = (
                     "Wrist height above the planted front foot, using your height to scale pixels"
+                    + (" (wrist interpolated to the measured leave instant)" if height_basis == "sub_frame" else "")
                 )
             else:
                 release_height_note = f"Computed {h_m:.2f} m is outside a realistic release height"
                 release_height_status = "unavailable"
         elif wr is not None and mpp and calibrated:
-            la = posemod.point(height_frame, "left_ankle")
-            ra = posemod.point(height_frame, "right_ankle")
+            la = posemod.point(rel_pose, "left_ankle")
+            ra = posemod.point(rel_pose, "right_ankle")
             ankles = [p for p in (la, ra) if p is not None]
             if ankles:
                 h_m = (max(float(p[1]) for p in ankles) - float(wr[1])) * mpp
@@ -1000,6 +1150,11 @@ def compute_metrics(
                     release_height_note = "Wrist height above ankles at release (pose + your height)"
                 else:
                     release_height_note = f"Computed {h_m:.2f} m is outside a realistic release height"
+        elif wrist_collapsed:
+            release_height_note = (
+                "Bowling-wrist landmark collapsed onto the arm at release — height not measured "
+                "rather than measured from the wrong point"
+            )
         elif not calibrated:
             release_height_note = scale_note or "Enter bowler height to compute release height"
         else:
@@ -1013,10 +1168,28 @@ def compute_metrics(
     release_time_ms = None
     time_note = None
     time_status = "unavailable"
+    time_basis = None
+    ffc_sub = subframes.get("front_foot_contact")
+    plant_fit = (action.get("phase_subframe_fit") or {}).get("front_foot_contact") or {}
+    time_factor = 1.0
     if ffc is not None and release_frame is not None and release_frame >= ffc:
-        release_time_ms = (release_frame - ffc) / max(fps, 1e-6) * 1000.0
+        if rel_sub is not None and ffc_sub is not None and float(rel_sub) >= float(ffc_sub):
+            # Both instants are fractional: the ankle's plant from a line through
+            # its descent, release from the ball's departure. Integer frames
+            # quantise this to ±8 ms at 120 fps and ±33 ms at 30.
+            release_time_ms = (float(rel_sub) - float(ffc_sub)) / max(fps, 1e-6) * 1000.0
+            time_basis = "sub_frame"
+            time_note = "Front-foot contact (lead ankle plant) → ball leaves the hand, both timed within the frame"
+        else:
+            release_time_ms = (release_frame - ffc) / max(fps, 1e-6) * 1000.0
+            time_basis = "integer_frames"
+            time_note = "Front-foot contact (lead ankle plant) → release"
         time_status = "ok"
-        time_note = "Front-foot contact (lead ankle plant) → release"
+        # How sharply the plant fitted a line is the evidence for the FFC instant.
+        if plant_fit.get("residual_px") is not None and plant_fit.get("drop_px"):
+            time_factor = _residual_factor(
+                float(plant_fit["residual_px"]), max(2.0, 0.15 * float(plant_fit["drop_px"])), floor=0.5
+            )
     else:
         time_note = "Front-foot contact not detected from lead ankle — release time unavailable"
 
@@ -1036,16 +1209,17 @@ def compute_metrics(
     ]
 
     ang_smooth = _odd_win(max(3, int(round(fps * 0.03))))
-    line_win = _odd_win(max(5, int(round(fps * 0.05))))
 
     arm_vel: list[float] = []
     arm_vidx: list[int] = []
+    arm_res: list[float] = []
     if side and series_frames:
         arm_idx, arm_ang = _line_angle_series(
             series_frames, f"{side}_shoulder", f"{side}_wrist", fps=fps,
         )
-        arm_vidx, arm_vel = _angular_velocity(arm_idx, arm_ang, fps, ang_smooth)
+        arm_vidx, arm_vel, arm_res = _angular_velocity(arm_idx, arm_ang, fps)
     arm_swing, arm_swing_raw = _peak_near_release(arm_vidx, arm_vel, release_frame, fps)
+    arm_swing_resid = _residual_near(arm_vidx, arm_res, release_frame, max(2, int(round(fps * 0.08))))
     arm_swing_note = None
     if arm_swing is not None and (arm_swing > 4000 or arm_swing < 40):
         arm_swing_note = (
@@ -1057,8 +1231,8 @@ def compute_metrics(
 
     hip_idx, hip_ang = _line_angle_series(series_frames, "right_hip", "left_hip", fps=fps)
     sh_idx, sh_ang = _line_angle_series(series_frames, "right_shoulder", "left_shoulder", fps=fps)
-    hip_vidx, hip_vel = _angular_velocity(hip_idx, hip_ang, fps, line_win)
-    sh_vidx, sh_vel = _angular_velocity(sh_idx, sh_ang, fps, line_win)
+    hip_vidx, hip_vel, hip_res = _angular_velocity(hip_idx, hip_ang, fps)
+    sh_vidx, sh_vel, sh_res = _angular_velocity(sh_idx, sh_ang, fps)
     # Hip and trunk peak during the delivery stride, before the arm — search the
     # whole stride window (SpinLab-style kinematic chain), not ±80 ms of release.
     rot_start = phases.get("back_foot_contact")
@@ -1078,6 +1252,9 @@ def compute_metrics(
         rot_end = int(w_end)
     hip_rot, hip_raw, hip_peak_fr = _peak_in_window(hip_vidx, hip_vel, rot_start, rot_end)
     trunk_rot, trunk_raw, trunk_peak_fr = _peak_in_window(sh_vidx, sh_vel, rot_start, rot_end)
+    rot_span = max(2, int(round(fps * 0.04)))
+    hip_resid = _residual_near(hip_vidx, hip_res, hip_peak_fr, rot_span)
+    trunk_resid = _residual_near(sh_vidx, sh_res, trunk_peak_fr, rot_span)
     hip_note = trunk_note = None
     if hip_rot is not None and (hip_rot > 1200 or hip_rot < 20):
         hip_note = f"Computed {hip_rot:.0f} deg/s is outside a realistic 2D pelvis-line band — not reported"
@@ -1112,11 +1289,23 @@ def compute_metrics(
     stride_pct = None
     stride_note = None
     stride_status = "unavailable"
+    stride_fit: dict[str, Any] = {"samples": 0, "spread": None}
     if ffc_pose is not None:
-        la = posemod.point(ffc_pose, "left_ankle")
-        ra = posemod.point(ffc_pose, "right_ankle")
-        if la is not None and ra is not None:
-            stride_px = float(np.linalg.norm(la - ra))
+        # The foot is still settling on the single FFC frame; the median over
+        # ±40 ms resists both that and one jittered ankle landmark.
+        stride_samples = [
+            float(np.linalg.norm(la_ - ra_))
+            for f in _frames_near(frames, ffc, fps, 0.04)
+            for la_, ra_ in [(posemod.point(f, "left_ankle"), posemod.point(f, "right_ankle"))]
+            if la_ is not None and ra_ is not None
+        ]
+        if stride_samples:
+            stride_px = float(np.median(stride_samples))
+            mad = float(np.median(np.abs(np.array(stride_samples) - stride_px)))
+            stride_fit = {
+                "samples": len(stride_samples),
+                "spread": round(mad / stride_px, 3) if stride_px > 0 else None,
+            }
             full_h_px = None
             if mpp and calibrated and height_m:
                 full_h_px = float(height_m) / float(mpp)
@@ -1135,7 +1324,10 @@ def compute_metrics(
                     stride_status = "unavailable"
                 elif 20 <= stride_pct <= 120:
                     stride_status = "ok"
-                    stride_note = "Ankle-to-ankle distance at front-foot contact, as % of your height"
+                    stride_note = (
+                        f"Median ankle-to-ankle distance over ±40 ms around front-foot contact "
+                        f"({stride_fit['samples']} frames), as % of your height"
+                    )
                 else:
                     stride_note = f"Computed {stride_pct:.0f}% height is outside a realistic stride"
                     stride_pct = None
@@ -1152,7 +1344,9 @@ def compute_metrics(
             joint_table[ph] = _joint_angles(frame_by_index(frames, phases.get(ph)), side or "right")
 
     rel_angles = joint_table.get("release", {}) if "release" in joint_table else _joint_angles(rel_pose, side or "right")
-    elbow_val, _elbow_frame = _best_elbow_near_release(frames, side or "right", release_frame, fps)
+    elbow_val, _elbow_frame, elbow_fit = _best_elbow_near_release(
+        frames, side or "right", release_frame, fps, release_subframe=rel_sub
+    )
     if elbow_val is not None:
         rel_angles = dict(rel_angles)
         rel_angles["elbow_extension"] = elbow_val
@@ -1285,9 +1479,14 @@ def compute_metrics(
     }
 
     elbow_note = (
-        "Interior elbow angle near release (180° = straight bowling arm)"
+        (
+            "Interior elbow angle at the measured leave instant (180° = straight bowling arm)"
+            if elbow_fit.get("basis") == "sub_frame"
+            else "Interior elbow angle near release (180° = straight bowling arm)"
+        )
         if elbow_val is not None else "Elbow not visible near release"
     )
+    elbow_conf = 0.6 * _residual_factor(elbow_fit.get("delta_deg"), 20.0, floor=0.5) if elbow_val is not None else 0.0
 
     # Overlay / results share this 4-item sequence (omit a row if the frame was not seen).
     # --- Consistency: the ball cannot leave slower than the wrist that threw it ---
@@ -1396,7 +1595,23 @@ def compute_metrics(
         },
         "release_frame": release_frame,
         "release_point": release_point,
+        "release_confidence": action.get("release_confidence"),
+        "release_note": action.get("release_note"),
         "phases": phases,
+        # Fractional frames feed the time-based metrics only; overlay, timeline,
+        # stills and PDF keep the integer `phases`.
+        "phase_subframes": subframes,
+        "precision": {
+            "release_time_basis": time_basis,
+            "release_height_basis": height_basis,
+            "elbow": elbow_fit,
+            "stride": stride_fit,
+            "plant_fit": plant_fit or None,
+            "wrist_speed_fit": action.get("wrist_speed_fit"),
+            "arm_swing_residual_deg": None if arm_swing_resid is None else round(arm_swing_resid, 2),
+            "hip_residual_deg": None if hip_resid is None else round(hip_resid, 2),
+            "trunk_residual_deg": None if trunk_resid is None else round(trunk_resid, 2),
+        },
         "phase_order": [p for p in PHASE_ORDER if p in phases],
         "phase_labels": {k: PHASE_LABELS[k] for k in PHASE_ORDER if k in phases},
         "phase_sources": action.get("phase_sources") or {},
@@ -1435,7 +1650,7 @@ def compute_metrics(
             estimated=False, status="ok" if hand_speed_px else "unavailable",
         ),
         "release_time_ms": _metric(
-            release_time_ms, "ms", act_conf if time_status == "ok" else 0.0, time_note,
+            release_time_ms, "ms", act_conf * time_factor if time_status == "ok" else 0.0, time_note,
             estimated=False, status=time_status,
         ),
         "hip_to_trunk_peak_gap_ms": _metric(
@@ -1447,26 +1662,27 @@ def compute_metrics(
             status="ok" if hip_trunk_gap_ms is not None else "unavailable",
         ),
         "arm_swing_speed_deg_s": _metric(
-            arm_swing, "deg/s", 0.55 if arm_swing is not None else 0.0,
+            arm_swing, "deg/s",
+            0.55 * _residual_factor(arm_swing_resid, 25.0) if arm_swing is not None else 0.0,
             arm_swing_note or "Bowling-arm angular speed (image plane)",
             estimated=True,
             status="ok" if arm_swing is not None else "unavailable",
             raw_computed=arm_swing_raw,
         ),
         "hip_rotation_speed_deg_s": _metric(
-            hip_rot, "deg/s", 0.25 if hip_rot is not None else 0.0, hip_note,
+            hip_rot, "deg/s", 0.25 * _residual_factor(hip_resid, 12.0) if hip_rot is not None else 0.0, hip_note,
             estimated=True,
             status="ok" if hip_rot is not None else "unavailable",
             raw_computed=hip_raw,
         ),
         "trunk_rotation_speed_deg_s": _metric(
-            trunk_rot, "deg/s", 0.25 if trunk_rot is not None else 0.0, trunk_note,
+            trunk_rot, "deg/s", 0.25 * _residual_factor(trunk_resid, 12.0) if trunk_rot is not None else 0.0, trunk_note,
             estimated=True,
             status="ok" if trunk_rot is not None else "unavailable",
             raw_computed=trunk_raw,
         ),
         "release_height_m": _metric(
-            release_height_m, "m", scale_conf if release_height_status == "ok" else 0.0,
+            release_height_m, "m", scale_conf * height_factor if release_height_status == "ok" else 0.0,
             release_height_note, estimated=True, status=release_height_status,
         ),
         "release_angle_deg": _metric(
@@ -1475,12 +1691,13 @@ def compute_metrics(
             estimated=True, status="ok" if release_angle is not None else "unavailable",
         ),
         "stride_length_pct_height": _metric(
-            stride_pct, "% height", 0.55 if stride_status == "ok" else 0.0, stride_note,
-            estimated=False, status=stride_status,
+            stride_pct, "% height",
+            0.55 * _residual_factor(stride_fit.get("spread"), 0.25, floor=0.5) if stride_status == "ok" else 0.0,
+            stride_note, estimated=False, status=stride_status,
         ),
         "elbow_extension_deg": _metric(
             elbow_val if elbow_val is not None else rel_angles.get("elbow_extension"), "deg",
-            0.6 if elbow_val is not None else 0.0,
+            elbow_conf,
             elbow_note,
             estimated=False,
             status="ok" if (elbow_val is not None or rel_angles.get("elbow_extension") is not None) else "unavailable",

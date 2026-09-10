@@ -136,9 +136,17 @@ def validate_ball_path_on_video(
     """Prove the track is a moving object on the pixels, not a tree or handshake.
 
     For each consecutive pair of track points we:
-      1. Lucas–Kanade the blob centre to the next frame
+      1. Lucas–Kanade the blob's flow anchor to the next frame
       2. Subtract background (camera) flow from Shi–Tomasi corners
       3. Require independent object flow to agree with the track step
+
+    A point may carry `flow_x` / `flow_y`: where on the blob to place the
+    tracked corner. The centre of a long motion-blur streak has no texture
+    along its own axis, so Lucas–Kanade slides on it and reports no motion
+    (the aperture problem) — every real 4K flight was failing this gate on
+    the centroid alone. The streak's leading end has the gradient the tracker
+    needs, so callers anchor there when a smear was measured. The expected
+    step is taken between anchors of the same kind, so it stays consistent.
 
     If too few samples can be measured, we *pass* (do not invent a reject).
     """
@@ -173,16 +181,16 @@ def validate_ball_path_on_video(
             ):
                 a = by_fr[prev_idx]
                 b = by_fr[idx]
-                expected = np.array(
-                    [(b["x"] - a["x"]) * sx, (b["y"] - a["y"]) * sy], dtype=np.float32
-                )
+                ax, ay = float(a.get("flow_x", a["x"])), float(a.get("flow_y", a["y"]))
+                bx, by = float(b.get("flow_x", b["x"])), float(b.get("flow_y", b["y"]))
+                expected = np.array([(bx - ax) * sx, (by - ay) * sy], dtype=np.float32)
                 exp_mag = float(np.linalg.norm(expected))
-                p0 = np.array([[[a["x"] * sx, a["y"] * sy]]], dtype=np.float32)
+                p0 = np.array([[[ax * sx, ay * sy]]], dtype=np.float32)
                 nxt, status = _lk(prev_gray, gray, p0)
                 cam = _background_flow(
                     prev_gray,
                     gray,
-                    (a["x"] * sx, a["y"] * sy),
+                    (ax * sx, ay * sy),
                     float(a.get("r") or 8) * (sx + sy) * 0.5,
                 )
                 cam_v = np.array(cam, dtype=np.float32)
