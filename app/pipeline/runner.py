@@ -147,66 +147,19 @@ async def run_analysis_job(
         )
         await progress.aset("ball", 1.0, "Ball path locked", force=True)
 
-        # --- Timebase: is the clip slow motion? ---
-        # Every phase window ("the front foot plants 60-600 ms before release")
-        # is cut in frames from fps, so a wrong fps mis-detects the events
-        # themselves. The ball's own fall says what the capture rate really was.
-        tb = timebase.measure_capture_fps(ball_track, scale.get("meters_per_pixel"), fps)
-        log.debug(
-            "timebase job_id=%s slow_motion=%s fps=%s container_fps=%s",
-            job_id,
-            tb.get("slow_motion"),
-            tb.get("fps"),
-            fps,
-        )
-
-        # The ball path is indexed by frame, so it does not change with the
-        # timebase and is never re-tracked here. What it does give us is the frame
-        # the ball left the hand — a measurement, where release detection from
-        # wrist speed alone is a heuristic. Re-run the action pass keyed to that
-        # frame (and to the corrected rate) so FFC, BFC and MER are searched
-        # relative to a real release rather than an estimated one.
-        leave = action_mod.ball_leave_frame(
-            pose_track, action.get("throwing_side"), ball_track, action.get("release_frame")
-        )
-        if tb.get("slow_motion"):
-            fps = float(tb["fps"])
-            pose_track["fps"] = fps
-            # Per-point km/h was baked in at the container rate while tracking.
-            # Leaving it would make the two ball-speed estimators disagree by
-            # exactly the slow-motion factor, and the disagreement guard would
-            # then refuse a speed we can measure perfectly well.
-            ball_track = track.annotate_frame_motion(
-                ball_track, fps, scale.get("meters_per_pixel")
-            )
-        if tb.get("slow_motion") or leave is not None:
-            action = action_mod.analyze_action(
-                pose_track, bowling_arm=bowling_arm, release_override=leave
-            )
-
-        # A track is kept if it is a real flight — an object that left the hand and
-        # kept moving. Whether its direction also supports a km/h is a *separate*
-        # question, answered by flight_geometry_ok inside metrics, which refuses
-        # the speed with its own reason. Deleting the path here because the speed
-        # is unmeasurable would blank the ball in the overlay, unpin release from
-        # the one frame we actually measured, and starve the gravity timebase —
-        # on every clip filmed from behind or down the pitch.
-        real_ok, _real_reason = flight_is_trackable(
-            ball_track, frame_w, frame_h, fps, scale.get("meters_per_pixel")
-        )
-        if ball_track and not real_ok:
-            log.debug("ball skip job_id=%s reason=%s", job_id, _real_reason)
-            ball_track = []
-            if leave is not None:  # release was pinned to a flight we just rejected
-                action = action_mod.analyze_action(pose_track, bowling_arm=bowling_arm)
-        elif ball_track:
-            action_mod.snap_release_to_ball_leave(pose_track, action, ball_track)
-        log.debug(
-            "ball job_id=%s locked=%s points=%s leave_frame=%s",
-            job_id,
-            bool(ball_track),
-            len(ball_track) if ball_track else 0,
-            leave,
+        # Timebase, release from the ball, keep-or-drop the flight. One stage so
+        # the order is fixed: the capture rate is settled *before* the ball's
+        # leave-hand fit, which pins gravity to that rate.
+        action, ball_track, tb, fps, leave = settle_after_track(
+            pose_track=pose_track,
+            action=action,
+            scale=scale,
+            ball_track=ball_track,
+            container_fps=fps,
+            frame_w=frame_w,
+            frame_h=frame_h,
+            bowling_arm=bowling_arm,
+            job_id=job_id,
         )
 
         # --- Metrics ---
@@ -283,10 +236,31 @@ async def run_analysis_job(
             storage["video_error"] = str(e)
             log.debug("overlay upload fail job_id=%s err=%s", job_id, type(e).__name__)
 
+        # The release still is the one image the results page and PDF both show.
+        # It was only ever kept on this box, and local cleanup deletes it once
+        # the overlay and PDF are confirmed on S3 — so in production the
+        # "Release frame" panel was permanently empty. Same files/ prefix as
+        # the PDF; the website API already reads `release_still_key`.
+        release_still_key = f"files/{job_id}_release.jpg"
+        try:
+            if release_still_path.is_file():
+                uploaded_still = await asyncio.to_thread(
+                    s3_service.upload_file, release_still_path, release_still_key, "image/jpeg"
+                )
+                if uploaded_still:
+                    storage["release_still_key"] = uploaded_still
+                    log.debug("release still uploaded key=%s", uploaded_still)
+        except Exception as e:  # never fail the job on an upload error
+            storage["still_error"] = str(e)
+            log.debug("release still upload fail job_id=%s err=%s", job_id, type(e).__name__)
+
         # --- Agent narrative ---
         await raise_if_cancelled(job_id)
         await progress.aset("agent", 0, "Writing your coaching notes", status="analyzing", force=True)
-        previous = await repo.list_deliveries(limit=8, player_name=player_name)
+        # Same bowler = same account. `player_name` alone defaults to "Bowler"
+        # for most uploads, which made one user's comparison baseline (and the
+        # coaching prompt) out of other people's deliveries.
+        previous = await repo.list_deliveries(limit=8, player_name=player_name, user_id=user_id)
         prev_metrics = [d.get("metrics") for d in previous if d.get("metrics")]
         comparison = ollama_agent.compare_deliveries(metrics, prev_metrics[:5])
         analysis = await ollama_agent.generate_report(
@@ -361,6 +335,7 @@ async def run_analysis_job(
                 "pdf": str(pdf_path),
                 "overlay_key": storage.get("overlay_key"),
                 "pdf_key": storage.get("pdf_key"),
+                "release_still_key": storage.get("release_still_key"),
             },
         }
         await raise_if_cancelled(job_id)
@@ -378,6 +353,7 @@ async def run_analysis_job(
                 "release_still_url": f"/artifacts/{job_id}/release.jpg",
                 "overlay_key": storage.get("overlay_key"),
                 "pdf_key": storage.get("pdf_key"),
+                "release_still_key": storage.get("release_still_key"),
             },
         )
     except JobCancelled:
@@ -390,6 +366,110 @@ async def run_analysis_job(
             message=str(e), error=traceback.format_exc(),
         )
         raise
+
+
+def settle_after_track(
+    *,
+    pose_track: dict[str, Any],
+    action: dict[str, Any],
+    scale: dict[str, Any],
+    ball_track: list[dict[str, Any]],
+    container_fps: float,
+    frame_w: int,
+    frame_h: int,
+    bowling_arm: str | None,
+    job_id: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any], float, dict[str, Any]]:
+    """Settle the capture rate, then release, then whether the flight is real.
+
+    Every phase window ("the front foot plants 60-600 ms before release") is
+    cut in frames from fps, so a wrong fps mis-detects the events themselves.
+    The ball's own fall says what the capture rate really was — that comes
+    first. The ball path is indexed by frame, so it does not change with the
+    timebase and is never re-tracked; its per-point km/h is re-annotated at the
+    corrected rate so the two ball-speed estimators cannot disagree by exactly
+    the slow-motion factor.
+
+    What the path does give us is the frame the ball left the hand — a
+    measurement, where release detection from wrist speed alone is a heuristic.
+    The leave fit is run at the settled rate (it pins gravity to it) and its
+    confidence decides whether the action pass is re-keyed to that frame. A
+    low-confidence leave leaves the pose release in place and records why, so
+    the metrics can say so instead of silently trusting either number.
+
+    A track is kept if it is a real flight — an object that left the hand and
+    kept moving. Whether its direction also supports a km/h is a *separate*
+    question, answered by flight_geometry_ok inside metrics, which refuses the
+    speed with its own reason. Deleting the path here because the speed is
+    unmeasurable would blank the ball in the overlay, unpin release from the
+    one frame we actually measured, and starve the gravity timebase.
+
+    Returns (action, ball_track, timebase, fps, leave_report).
+    """
+    fps = float(container_fps)
+    mpp = scale.get("meters_per_pixel")
+    tb = timebase.measure_capture_fps(ball_track, mpp, fps)
+    log.debug(
+        "timebase job_id=%s slow_motion=%s fps=%s container_fps=%s",
+        job_id,
+        tb.get("slow_motion"),
+        tb.get("fps"),
+        fps,
+    )
+    if tb.get("slow_motion"):
+        fps = float(tb["fps"])
+        pose_track["fps"] = fps
+        ball_track = track.annotate_frame_motion(ball_track, fps, mpp)
+
+    side = action.get("throwing_side")
+    leave = action_mod.ball_leave_frame(
+        pose_track, side, ball_track, action.get("release_frame"), fps=fps, meters_per_pixel=mpp
+    )
+    confident = (
+        leave.get("frame") is not None
+        and float(leave.get("confidence") or 0.0) >= action_mod.LEAVE_MIN_CONFIDENCE
+    )
+    log.debug(
+        "ball leave job_id=%s frame=%s subframe=%s confidence=%s pose_release=%s note=%s",
+        job_id,
+        leave.get("frame"),
+        leave.get("subframe"),
+        leave.get("confidence"),
+        action.get("release_frame"),
+        leave.get("note"),
+    )
+    if tb.get("slow_motion") or confident:
+        action = action_mod.analyze_action(
+            pose_track,
+            bowling_arm=bowling_arm,
+            release_override=int(leave["frame"]) if confident else None,
+            release_subframe=leave.get("subframe") if confident else None,
+        )
+    action["release_confidence"] = float(leave.get("confidence") or 0.0)
+    action["release_note"] = leave.get("note")
+
+    real_ok, real_reason = flight_is_trackable(ball_track, frame_w, frame_h, fps, mpp)
+    if ball_track and not real_ok:
+        log.debug("ball skip job_id=%s reason=%s", job_id, real_reason)
+        ball_track = []
+        if confident:  # release was pinned to a flight we just rejected
+            action = action_mod.analyze_action(pose_track, bowling_arm=bowling_arm)
+            action["release_confidence"] = 0.0
+            action["release_note"] = f"tracked flight rejected: {real_reason}"
+    elif ball_track:
+        leave = action_mod.snap_release_to_ball_leave(
+            pose_track, action, ball_track, fps=fps, meters_per_pixel=mpp
+        )
+    log.debug(
+        "ball job_id=%s locked=%s points=%s release_frame=%s source=%s confidence=%s",
+        job_id,
+        bool(ball_track),
+        len(ball_track) if ball_track else 0,
+        action.get("release_frame"),
+        (action.get("phase_sources") or {}).get("release"),
+        action.get("release_confidence"),
+    )
+    return action, ball_track, tb, fps, leave
 
 
 def _strip_series(action: dict[str, Any]) -> dict[str, Any]:

@@ -131,8 +131,29 @@ def _scale_candidates(cands: list[dict[str, Any]], sx: float, sy: float) -> list
         d["x"] = float(c["x"]) * sx
         d["y"] = float(c["y"]) * sy
         d["r"] = float(c.get("r") or 0) * sm
+        if c.get("streak_len") is not None:
+            d["streak_len"] = float(c["streak_len"]) * sm
+            d["streak_width"] = float(c.get("streak_width") or 0) * sm
+            for key in ("streak_p0", "streak_p1"):
+                pt = c.get(key)
+                if pt is not None:
+                    d[key] = (float(pt[0]) * sx, float(pt[1]) * sy)
+            p0, p1 = d.get("streak_p0"), d.get("streak_p1")
+            if p0 is not None and p1 is not None:
+                d["streak_angle_deg"] = float(np.degrees(np.arctan2(p1[1] - p0[1], p1[0] - p0[0])))
         out.append(d)
     return out
+
+
+def _offset_candidates(cands: list[dict[str, Any]], x0: float, y0: float) -> None:
+    """Move ROI-crop candidates (and their streak ends) into full-frame pixels, in place."""
+    for c in cands:
+        c["x"] += x0
+        c["y"] += y0
+        for key in ("streak_p0", "streak_p1"):
+            pt = c.get(key)
+            if pt is not None:
+                c[key] = (float(pt[0]) + x0, float(pt[1]) + y0)
 
 
 def collect_flight_candidates(
@@ -186,6 +207,48 @@ def collect_flight_candidates(
     return _scale_candidates(merged, sx, sy), gray
 
 
+def streak_geometry(contour: np.ndarray) -> dict[str, float] | None:
+    """Major axis of a motion-blur streak from the contour's own second moments.
+
+    A ball smeared over the exposure is a thin stadium; its central moments give
+    the axis orientation directly and, for a uniform bar of length L, a variance
+    of L²/12 along that axis. Nothing here reads shutter or exposure metadata —
+    it is purely the shape of the blob already found. The angle is in image
+    convention (y down), in (-90, 90], and the endpoints are the axis ends about
+    the moment centroid.
+    """
+    m = cv2.moments(contour)
+    m00 = float(m.get("m00") or 0.0)
+    if m00 < 4.0:
+        return None
+    mu20 = float(m["mu20"]) / m00
+    mu02 = float(m["mu02"]) / m00
+    mu11 = float(m["mu11"]) / m00
+    half_sum = 0.5 * (mu20 + mu02)
+    half_diff = 0.5 * (mu20 - mu02)
+    root = float(np.sqrt(half_diff * half_diff + mu11 * mu11))
+    lam1 = max(half_sum + root, 1e-9)
+    lam2 = max(half_sum - root, 1e-9)
+    theta = 0.5 * float(np.arctan2(2.0 * mu11, mu20 - mu02))
+    length = float(np.sqrt(12.0 * lam1))
+    width = float(np.sqrt(12.0 * lam2))
+    cx = float(m["m10"]) / m00
+    cy = float(m["m01"]) / m00
+    dx, dy = float(np.cos(theta)), float(np.sin(theta))
+    return {
+        "angle_deg": float(np.degrees(theta)),
+        "len": length,
+        "width": width,
+        "cx": cx,
+        "cy": cy,
+        "p0": (cx - 0.5 * length * dx, cy - 0.5 * length * dy),
+        "p1": (cx + 0.5 * length * dx, cy + 0.5 * length * dy),
+    }
+
+
+STREAK_KEYS = ("streak_angle_deg", "streak_len", "streak_width", "streak_p0", "streak_p1")
+
+
 def _blob_candidates(
     mask: np.ndarray,
     origin_xy: tuple[int, int] = (0, 0),
@@ -214,6 +277,9 @@ def _blob_candidates(
         aspect = long / max(thin, 1.0)
         # A 120 fps white ball is a streak, not a disc — especially on a
         # three-quarter / blurry angle where the ball smears along the path.
+        # (Judging elongation from second moments instead of the bounding box
+        # was tried and reverted: it admitted arm/net blobs twice the ball's
+        # size as "streaks" and doubled the fit residual on the reference clip.)
         streak = (
             aspect >= 1.75
             and thin <= cricket_r * 1.85
@@ -228,7 +294,7 @@ def _blob_candidates(
         compact_score = float(circularity * (1.2 + cricket_r / max(radius, 2.0)))
         if streak:
             compact_score = max(compact_score, 1.4 + thin / max(cricket_r, 1.0))
-        cands.append({
+        cand: dict[str, Any] = {
             "x": float(cx + ox),
             "y": float(cy + oy),
             "r": float(radius),
@@ -236,7 +302,19 @@ def _blob_candidates(
             "size_score": size_score,
             "compact_score": compact_score,
             "streak": streak,
-        })
+        }
+        if streak:
+            # The centre stays the enclosing-circle centre (what every gate
+            # downstream was tuned on); the axis and its ends ride alongside so
+            # optical flow can be checked on the smear's leading edge.
+            geo = streak_geometry(c)
+            if geo is not None:
+                cand["streak_angle_deg"] = geo["angle_deg"]
+                cand["streak_len"] = geo["len"]
+                cand["streak_width"] = geo["width"]
+                cand["streak_p0"] = (geo["p0"][0] + ox, geo["p0"][1] + oy)
+                cand["streak_p1"] = (geo["p1"][0] + ox, geo["p1"][1] + oy)
+        cands.append(cand)
     if not cands:
         return []
     keep: dict[tuple[int, int], dict[str, Any]] = {}
@@ -370,25 +448,17 @@ def detect_ball_in_roi(
     crop = bgr[y0:y1, x0:x1]
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     color = detect_ball_color_candidates(crop, mask_edges=False)
-    for c in color:
-        c["x"] += x0
-        c["y"] += y0
+    _offset_candidates(color, x0, y0)
     dark = detect_dark_flight_candidates(crop, mask_ground=False)
-    for c in dark:
-        c["x"] += x0
-        c["y"] += y0
+    _offset_candidates(dark, x0, y0)
     bright = detect_bright_flight_candidates(crop, mask_edges=False)
-    for c in bright:
-        c["x"] += x0
-        c["y"] += y0
+    _offset_candidates(bright, x0, y0)
     motion: list[dict[str, Any]] = []
     if prev_gray is not None:
         prev_crop = prev_gray[y0:y1, x0:x1]
         if prev_crop.shape[:2] == gray.shape[:2]:
             motion = detect_ball_motion_candidates(prev_crop, gray)
-            for c in motion:
-                c["x"] += x0
-                c["y"] += y0
+            _offset_candidates(motion, x0, y0)
     return merge_ball_candidates(
         color, dark, bright, motion, cricket_r=_cricket_r(*gray.shape[:2])
     )
@@ -435,7 +505,8 @@ def merge_ball_candidates(
         c_compact = float(c.get("compact_score") or 0)
         h_compact = float(hit.get("compact_score") or 0)
         prefer = c.get("source") == "motion" and hit.get("source") != "motion"
-        if prefer or c_compact > h_compact:
+        adopted = prefer or c_compact > h_compact
+        if adopted:
             hit["x"] = float(c["x"])
             hit["y"] = float(c["y"])
             hit["r"] = float(c.get("r") or hit.get("r") or 0)
@@ -446,6 +517,12 @@ def merge_ball_candidates(
         hit["score"] = max(float(hit.get("score") or 0), float(c.get("score") or 0))
         if c.get("streak"):
             hit["streak"] = True
+        # The axis must describe the blob whose centre we kept, so it moves with
+        # the adopted coordinates — or fills a gap when the kept hit had none.
+        if c.get("streak_len") is not None and (adopted or hit.get("streak_len") is None):
+            for key in STREAK_KEYS:
+                if c.get(key) is not None:
+                    hit[key] = c[key]
 
     for group in groups:
         ranked = sorted(group, key=lambda d: d.get("score") or 0, reverse=True)[:per_group]

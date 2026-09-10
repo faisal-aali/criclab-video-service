@@ -10,11 +10,11 @@ read-only copy of `app/coaching/drills.json` for matching after CV.
 
 ## Run locally
 
-Same Mongo, Cloudinary, and `STORAGE_DIR` as `criclab-web-backend`.
+Same Mongo, S3 bucket, and `STORAGE_DIR` as `criclab-web-backend`.
 Auth, SMTP, and CORS stay on the website API — they are not used here.
 
 ```bash
-python3.11 -m venv .venv312
+python3.12 -m venv .venv312
 source .venv312/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # already filled locally; keep it gitignored
@@ -25,10 +25,10 @@ python -m app.worker
 Website backend no longer starts analysis in-process. If no worker is running,
 jobs stay at `queued` until one is.
 
-## Production (Lightsail)
+## Production (EC2 worker instance)
 
-Clone to `/var/www/criclab-video-service`, copy `.env` (Mongo / Cloudinary /
-`STORAGE_DIR` matching the API), then:
+Clone to `/var/www/criclab-video-service`, copy `.env` (Mongo / S3 / `STORAGE_DIR`
+matching the API, plus `DAILY_VIDEO_QUOTA` and the `EC2_*` idle-stop settings), then:
 
 ```bash
 pm2 start deploy/ecosystem.config.cjs

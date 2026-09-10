@@ -226,7 +226,9 @@ async def _fail_stale_running_in(collection, kind: str) -> None:
         "status": {"$in": ["processing", "analyzing"]},
         "updated_at": {"$lt": cutoff},
     }
-    docs = await collection.find(filt, {"_id": 1, "video_id": 1, "session_id": 1}).to_list(200)
+    docs = await collection.find(
+        filt, {"_id": 1, "video_id": 1, "session_id": 1, "quota_day": 1}
+    ).to_list(200)
     if not docs:
         return
     await collection.update_many(
@@ -244,6 +246,14 @@ async def _fail_stale_running_in(collection, kind: str) -> None:
         },
     )
     for job in docs:
+        # A failed clip gives its daily slot back, exactly as `_finish_slot`
+        # does for a job that failed in-process. Without this every stale
+        # fail left `quota_days.started` one higher for good, so the cap
+        # quietly shrank by one each time a worker died mid-clip.
+        try:
+            await quota.release_lease(job.get("quota_day"))
+        except Exception:
+            log.exception("quota release after stale fail %s", job.get("_id"))
         try:
             await original_archive.maybe_archive_for_job(job)
         except Exception:
@@ -323,7 +333,13 @@ async def _claim_next_fifo(worker_id: str) -> tuple[dict | None, str | None]:
     if day is None:
         return None, "quota_full"
     claim = repo.claim_job if kind == "action" else bt_repo.claim_job
-    job = await claim(pick["_id"], worker_id, day)
+    try:
+        job = await claim(pick["_id"], worker_id, day)
+    except Exception:
+        # The slot was taken but no job carries it — give it back before the
+        # error propagates, or the day's cap shrinks by one per Mongo hiccup.
+        await quota.release_lease(day)
+        raise
     if job is None:
         await quota.release_lease(day)
         log.debug("claim lost job_id=%s kind=%s", pick["_id"], kind)
@@ -453,6 +469,17 @@ async def worker_loop() -> None:
         except asyncio.CancelledError:
             log.info("video worker %s stopped", WORKER_ID)
             return
+        except Exception:
+            # A transient Mongo error while sweeping or claiming used to end
+            # the process (PM2 restarts it, but any in-flight lease was lost
+            # with it). Log it and try again after a short pause instead.
+            log.exception("worker tick failed; retrying")
+            try:
+                await asyncio.sleep(3.0)
+            except asyncio.CancelledError:
+                log.info("video worker %s stopped", WORKER_ID)
+                return
+            continue
         if kind == "quota_full" or job is None:
             now = time.monotonic()
             if idle_since is None:
@@ -501,19 +528,41 @@ async def worker_loop() -> None:
         except JobCancelled:
             log.debug("job cancelled job_id=%s kind=%s", job_id, kind)
             log.info("job %s cancelled; not persisting", job_id)
-        except Exception:
+        except Exception as exc:
             log.exception("job %s failed", job_id)
             fail = dict(
                 status="failed",
                 stage="failed",
-                message="Video worker failed",
+                message=_user_failure_message(exc),
                 error=traceback.format_exc(),
             )
-            if kind == "action":
-                await repo.update_job(job_id, **fail)
-            else:
-                await bt_repo.update_job(job_id, **fail)
-        await _finish_slot(job, kind)
+            try:
+                if kind == "action":
+                    await repo.update_job(job_id, **fail)
+                else:
+                    await bt_repo.update_job(job_id, **fail)
+            except Exception:
+                log.exception("could not record failure for job %s", job_id)
+        try:
+            await _finish_slot(job, kind)
+        except Exception:
+            log.exception("finish-slot failed for job %s", job_id)
+
+
+def _user_failure_message(exc: BaseException) -> str:
+    """The sentence the results page shows for a failed clip.
+
+    Ingest deliberately raises `ValueError` with the same wording as the
+    uploader (too large, empty, wrong container) and `ArchivedOriginalError`
+    says the clip is no longer available. Those are for the user; anything
+    else is an internal fault and gets the generic line so a traceback's
+    text never reaches the screen.
+    """
+    if isinstance(exc, (ValueError, FileNotFoundError, s3_service.ArchivedOriginalError)):
+        text = str(exc).strip()
+        if text and len(text) <= 300:
+            return text
+    return "Video worker failed"
 
 
 def main() -> None:

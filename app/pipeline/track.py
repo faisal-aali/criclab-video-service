@@ -392,15 +392,25 @@ def track_ball_from_release(
         if not ok_geo:
             _why(f"geo {geo_note}")
             continue
-        cand = _refine_centroids(video_path, cand, frame_w, frame_h)
-        cand = _trim_lost_lock(cand)
+        # Optical flow is checked on the *raw* detections, before the centroid
+        # refinement. Lucas–Kanade follows the bright head or edge a detector
+        # locked onto; the middle of a uniform motion-blur streak has no
+        # texture along its own axis (the aperture problem), so validating the
+        # re-centred points rejected every real 4K flight. The gate answers
+        # "is this a moving object on the pixels" — the detections answer that;
+        # the refinement only improves where along the smear we measure.
         detected = [p for p in cand if p.get("source") != "interpolated"]
-        cand = fill_every_frame(cand)
-        flow_pts = detected if len(detected) >= 5 else cand
+        flow_pts = _flow_anchors(detected if len(detected) >= 5 else cand)
         ok_flow, flow_note, flow_stats = validate_ball_path_on_video(video_path, flow_pts, frame_w, frame_h)
         if not ok_flow:
             _why(f"flow {flow_note} {flow_stats}")
             continue
+        cand = _refine_centroids(video_path, cand, frame_w, frame_h)
+        cand = _trim_lost_lock(cand)
+        if len(cand) < 5:
+            _why("refine<5")
+            continue
+        cand = fill_every_frame(cand)
         if dbg:
             print(f"  KEEP n={len(cand)} f{cand[0]['frame']} speed={speed:.1f} flow={flow_stats}", flush=True)
         key = (speed, len(cand), -int(cand[0]["frame"]))
@@ -657,14 +667,26 @@ def _extend_backward(
     return sorted(added + pts, key=lambda p: int(p["frame"]))
 
 
+STREAK_KEYS = ("streak_angle_deg", "streak_len", "streak_width", "streak_p0", "streak_p1")
+
+
 def _point(frame: int, c: dict[str, Any], source: str = "detected") -> dict[str, Any]:
-    return {
+    out: dict[str, Any] = {
         "frame": int(frame),
         "x": float(c["x"]),
         "y": float(c["y"]),
         "r": float(c.get("r") or 6),
         "source": source,
     }
+    # A motion-blur streak's axis rides along with the point so the centroid
+    # refinement can size its window to the whole smear, not the enclosing
+    # circle of whichever fragment a detector happened to threshold.
+    if c.get("streak"):
+        out["streak"] = True
+        for key in STREAK_KEYS:
+            if c.get(key) is not None:
+                out[key] = c[key]
+    return out
 
 
 def _greedy_chain(
@@ -966,8 +988,37 @@ def _ballistic_clean(path: list[dict[str, Any]], frame_w: int, frame_h: int) -> 
     return current
 
 
-def _blob_centroid(bgr: np.ndarray, x: float, y: float, rad: float) -> tuple[float, float] | None:
-    """Sub-pixel centre of the locked blob — dark *or* white cricket ball."""
+def _mask_axis(mask: np.ndarray) -> tuple[float, float, float] | None:
+    """(angle_deg, length, width) of a binary blob from its central moments.
+
+    Same estimator as `detect.streak_geometry`, applied to a pixel mask rather
+    than a contour: a uniform bar of length L has variance L²/12 along its axis.
+    """
+    m = cv2.moments(mask, binaryImage=True)
+    m00 = float(m.get("m00") or 0.0)
+    if m00 < 4.0:
+        return None
+    mu20, mu02, mu11 = m["mu20"] / m00, m["mu02"] / m00, m["mu11"] / m00
+    half_sum, half_diff = 0.5 * (mu20 + mu02), 0.5 * (mu20 - mu02)
+    root = float(np.sqrt(half_diff * half_diff + mu11 * mu11))
+    lam1, lam2 = max(half_sum + root, 1e-9), max(half_sum - root, 1e-9)
+    theta = 0.5 * float(np.arctan2(2.0 * mu11, mu20 - mu02))
+    return float(np.degrees(theta)), float(np.sqrt(12.0 * lam1)), float(np.sqrt(12.0 * lam2))
+
+
+def _blob_centroid(bgr: np.ndarray, x: float, y: float, rad: float) -> dict[str, float] | None:
+    """Sub-pixel centre of the locked blob — dark *or* white cricket ball.
+
+    Deliberately the same crop, threshold polarity and whole-mask moments the
+    speed work was validated with. A wider, streak-length crop with
+    nearest-component selection was tried so that a fragmentary detection
+    would be re-centred on the whole smear; on the reference 4K clip it made
+    the fitted x-residual worse (6.7 → 15.6 px) and the speed refused, so it
+    was taken out. What is kept is the *readout*: the thresholded blob's own
+    axis and length, so the caller can record the smear's orientation.
+
+    Returns ``{"x", "y", "angle_deg", "len", "width", "area"}`` or None.
+    """
     h, w = bgr.shape[:2]
     r = int(max(8.0, rad))
     x0, y0 = max(0, int(x) - r), max(0, int(y) - r)
@@ -981,31 +1032,113 @@ def _blob_centroid(bgr: np.ndarray, x: float, y: float, rad: float) -> tuple[flo
         _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     else:
         _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    m = cv2.moments(mask)
+    m = cv2.moments(mask, binaryImage=True)
     if m["m00"] < 16:
         return None
     cx = float(m["m10"] / m["m00"]) + x0
     cy = float(m["m01"] / m["m00"]) + y0
     if float(np.hypot(cx - x, cy - y)) > rad * 1.15:
         return None
-    return cx, cy
+    axis = _mask_axis(mask)
+    return {
+        "x": cx,
+        "y": cy,
+        "angle_deg": axis[0] if axis else 0.0,
+        "len": axis[1] if axis else 0.0,
+        "width": axis[2] if axis else 0.0,
+        "area": float(m["m00"]),
+    }
+
+
+def _local_directions(ordered: list[dict[str, Any]]) -> dict[int, tuple[float, float] | None]:
+    """Unit direction of travel at each detected sample, from its neighbours."""
+    out: dict[int, tuple[float, float] | None] = {}
+    n = len(ordered)
+    for i, p in enumerate(ordered):
+        a = ordered[max(0, i - 1)]
+        b = ordered[min(n - 1, i + 1)]
+        dx, dy = float(b["x"]) - float(a["x"]), float(b["y"]) - float(a["y"])
+        mag = float(np.hypot(dx, dy))
+        out[int(p["frame"])] = (dx / mag, dy / mag) if mag > 1e-6 else None
+    return out
+
+
+def _flow_anchors(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copies of the points with `flow_x`/`flow_y` set where optical flow can track.
+
+    For a smeared ball the detector recorded the streak's axis and ends. The
+    end that lies ahead along the local direction of travel is the leading
+    edge — the one place on a uniform smear with a gradient along the motion,
+    which is what Lucas–Kanade needs to measure that motion. Compact blobs
+    keep their centre. Coordinates used for fitting are untouched.
+    """
+    ordered = sorted(points, key=lambda p: int(p["frame"]))
+    if not ordered:
+        return points
+    r_med = _track_ball_r(ordered)
+    dirs = _local_directions(ordered)
+    out: list[dict[str, Any]] = []
+    for p in ordered:
+        q = dict(p)
+        p0, p1 = p.get("streak_p0"), p.get("streak_p1")
+        d = dirs.get(int(p["frame"]))
+        length = float(p.get("streak_len") or 0.0)
+        if p0 is not None and p1 is not None and d is not None and length >= 1.5 * r_med:
+            cx, cy = float(p["x"]), float(p["y"])
+            score0 = (float(p0[0]) - cx) * d[0] + (float(p0[1]) - cy) * d[1]
+            score1 = (float(p1[0]) - cx) * d[0] + (float(p1[1]) - cy) * d[1]
+            lead = p1 if score1 >= score0 else p0
+            q["flow_x"], q["flow_y"] = float(lead[0]), float(lead[1])
+        out.append(q)
+    return out
 
 
 def _refine_centroids(video_path, path: list[dict[str, Any]], frame_w: int, frame_h: int) -> list[dict[str, Any]]:
+    """Re-centre every detected sample on its blob (unchanged measurement).
+
+    A refinement that moves a point more than 2.5x its own radius is not a
+    re-centring but a different object (the arm, a net wire), so it is rejected
+    and the original detection kept — `_blob_centroid` already refuses beyond
+    1.15x its crop. The local direction of travel is used only to record how
+    well the smear's axis agrees with the path and where its leading end lies:
+    diagnostics for the overlay and the leave fit, never the fitted position.
+    """
     from app.pipeline import extract
 
     det = {int(p["frame"]): p for p in path if p.get("source") == "detected"}
     if len(det) < 4:
         return path
+    ordered = [det[k] for k in sorted(det)]
+    r_med = _track_ball_r(ordered)
+    dirs = _local_directions(ordered)
     f0, f1 = min(det), max(det)
     for idx, bgr in extract.iter_frame_range(video_path, f0, f1):
         p = det.get(idx)
         if p is None:
             continue
-        hit = _blob_centroid(bgr, p["x"], p["y"], max(10.0, float(p.get("r") or 10) * 1.6))
+        r_pt = max(6.0, float(p.get("r") or r_med))
+        hit = _blob_centroid(bgr, p["x"], p["y"], max(10.0, r_pt * 1.6))
         if hit is None:
             continue
-        p["x"], p["y"] = float(hit[0]), float(hit[1])
+        moved = float(np.hypot(hit["x"] - float(p["x"]), hit["y"] - float(p["y"])))
+        if moved > 2.5 * r_pt:
+            p["refine_rejected_px"] = round(moved, 1)
+            continue
+        p["x"], p["y"] = float(hit["x"]), float(hit["y"])
+        p["refined"] = True
+        if hit["len"] > 0:
+            p["streak_len_refined"] = round(float(hit["len"]), 1)
+            p["streak_angle_refined_deg"] = round(float(hit["angle_deg"]), 1)
+        d = dirs.get(idx)
+        elongated = hit["len"] >= 1.5 * max(hit["width"], 1.0) and hit["len"] >= 1.5 * r_med
+        if d is not None and elongated:
+            th = float(np.radians(hit["angle_deg"]))
+            ax, ay = float(np.cos(th)), float(np.sin(th))
+            dot = ax * d[0] + ay * d[1]
+            p["streak_align"] = round(abs(dot), 3)
+            sgn = 1.0 if dot >= 0 else -1.0
+            p["lead_x"] = round(float(hit["x"]) + sgn * 0.5 * float(hit["len"]) * ax, 1)
+            p["lead_y"] = round(float(hit["y"]) + sgn * 0.5 * float(hit["len"]) * ay, 1)
     return path
 
 

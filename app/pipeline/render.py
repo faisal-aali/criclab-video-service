@@ -208,6 +208,10 @@ def render_overlay_video(
             "pt": (int(p["x"] * scale), int(p["y"] * scale)),
             "speed_kmh": p.get("speed_kmh"),
             "r": max(6.0, float(p.get("r") or 8) * scale),
+            # Interpolated points come from the fitted parabola, not from a
+            # detection; the trail draws them differently so the overlay shows
+            # where the detector actually lost the ball.
+            "source": p.get("source") or "detected",
         }
 
     fps_src = float(pose_track.get("fps") or in_fps)
@@ -464,18 +468,37 @@ def _smooth_wrist_trail(
     return [(int(f), (int(x), int(y))) for f, x, y in zip(raw_f, xs, ys)]
 
 
+def _dashed_line(img, p0, p1, color, thickness, dash: int = 6, gap: int = 5) -> None:
+    """Short dashes from p0 to p1 — the honest look for a segment nobody detected."""
+    x0, y0 = float(p0[0]), float(p0[1])
+    x1, y1 = float(p1[0]), float(p1[1])
+    length = float(np.hypot(x1 - x0, y1 - y0))
+    if length < 1.0:
+        return
+    ux, uy = (x1 - x0) / length, (y1 - y0) / length
+    pos = 0.0
+    while pos < length:
+        a = (int(round(x0 + ux * pos)), int(round(y0 + uy * pos)))
+        end = min(length, pos + dash)
+        b = (int(round(x0 + ux * end)), int(round(y0 + uy * end)))
+        cv2.line(img, a, b, color, thickness, cv2.LINE_AA)
+        pos += dash + gap
+
+
 def _draw_trail(frame, idx, wrist_trail, ball_pts_by_frame, phases, events, release_frame,
                 release_speed_kmh=None):
     past_wrist = [(fr, pt) for fr, pt in wrist_trail if fr <= idx]
     past_ball = sorted(
-        (fr, v["pt"])
+        (fr, v["pt"], v.get("source") or "detected")
         for fr, v in ball_pts_by_frame.items()
         if fr <= idx and (release_frame is None or fr >= int(release_frame))
     )
     if release_frame is not None and past_wrist and past_ball:
         rel_pt = min(past_wrist, key=lambda t: abs(t[0] - int(release_frame)))[1]
         if past_ball[0][1] != rel_pt:
-            past_ball = [(int(release_frame), rel_pt)] + past_ball
+            # The hop from the REL marker to the first detection is drawn, but
+            # it is no measurement — it gets the same faint dashes as a gap.
+            past_ball = [(int(release_frame), rel_pt, "extrapolated")] + past_ball
 
     def stroke(points: list[tuple[int, tuple[int, int]]], thickness: int):
         if len(points) < 2:
@@ -504,9 +527,32 @@ def _draw_trail(frame, idx, wrist_trail, ball_pts_by_frame, phases, events, rele
             cv2.polylines(layer, [arr], False, col, thickness, cv2.LINE_AA)
         cv2.addWeighted(layer, TRAIL_ALPHA, frame, 1.0 - TRAIL_ALPHA, 0, frame)
 
+    def stroke_ball(points: list[tuple[int, tuple[int, int], str]]):
+        """Solid between two detections; thin, faint dashes wherever a point was
+        interpolated or extrapolated. Metrics never fit those points either."""
+        if len(points) < 2:
+            return
+        solid = frame.copy()
+        faint = frame.copy()
+        any_solid = any_faint = False
+        for (_f0, p0, s0), (f1, p1, s1) in zip(points, points[1:]):
+            col = _color_for_frame(f1, phases)
+            if s0 == "detected" and s1 == "detected":
+                cv2.line(solid, p0, p1, (22, 22, 22), TRAIL_W_BALL + 3, cv2.LINE_AA)
+                cv2.line(solid, p0, p1, col, TRAIL_W_BALL, cv2.LINE_AA)
+                any_solid = True
+            else:
+                _dashed_line(faint, p0, p1, col, max(1, TRAIL_W_BALL - 1))
+                any_faint = True
+        if any_solid:
+            cv2.addWeighted(solid, TRAIL_ALPHA, frame, 1.0 - TRAIL_ALPHA, 0, frame)
+        if any_faint:
+            a = TRAIL_ALPHA * 0.6
+            cv2.addWeighted(faint, a, frame, 1.0 - a, 0, frame)
+
     # Hand path is the hero. Ball path continues after REL.
     stroke(past_wrist, TRAIL_W_HAND)
-    stroke(past_ball, TRAIL_W_BALL)
+    stroke_ball(past_ball)
 
     # Phase beads on the hand path.
     if past_wrist:
@@ -528,11 +574,19 @@ def _draw_trail(frame, idx, wrist_trail, ball_pts_by_frame, phases, events, rele
         cx, cy = live["pt"]
         br = int(max(10, live.get("r") or 10))
         color = _color_for_frame(idx, phases)
+        detected = (live.get("source") or "detected") == "detected"
         ring = frame.copy()
-        cv2.ellipse(ring, (cx, cy), (br, max(8, int(br * 0.72))), 0, 0, 360, color, 2, cv2.LINE_AA)
-        cv2.circle(ring, (cx, cy), 3, WHITE, -1, cv2.LINE_AA)
+        axes = (br, max(8, int(br * 0.72)))
+        if detected:
+            cv2.ellipse(ring, (cx, cy), axes, 0, 0, 360, color, 2, cv2.LINE_AA)
+            cv2.circle(ring, (cx, cy), 3, WHITE, -1, cv2.LINE_AA)
+        else:
+            # Dashed ring, no centre dot: the fitted path says the ball is about
+            # here, but nothing on this frame was measured.
+            for a0 in range(0, 360, 45):
+                cv2.ellipse(ring, (cx, cy), axes, 0, a0, a0 + 25, color, 1, cv2.LINE_AA)
         cv2.addWeighted(ring, MARKER_ALPHA, frame, 1.0 - MARKER_ALPHA, 0, frame)
-        _text(frame, "BALL", (cx + br + 8, cy - br), 0.5, color, 1)
+        _text(frame, "BALL" if detected else "BALL (est.)", (cx + br + 8, cy - br), 0.5, color, 1)
         # Deliberately the *measured release speed*, not this frame's raw
         # displacement. The per-frame value swung 81-133 km/h on noise alone,
         # so the ball was being labelled 133 on the same frame the panel read
